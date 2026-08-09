@@ -1,0 +1,26 @@
+{
+  "name": "bportal",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 3000",
+    "pyserver": "python backend.py",
+    "server": "node server.js",
+    "backend": "npm run pyserver",
+    "dev:all": "concurrently \"npm:pyserver\" \"npm:dev\"",
+    "start": "npm run dev:all",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "lucide-react": "^0.542.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^3.1.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.1",
+    "concurrently": "^8.2.1",
+    "vite": "^5.4.10"
+  }
+}
