@@ -33,7 +33,7 @@ const SERVICE_TYPES = [
 
 const POSITIONS = [
   "Punong Barangay", "Barangay Kagawad", "SK Chairperson",
-  "Barangay Secretary", "Barangay Treasurer", "Barangay Tanod", "Barangay Staff",
+  "Barangay Secretary", "Barangay Treasurer", "Barangay Tanod", "Barangay Staff","SK Treasurer","SK Secretary","SK Councilor"
 ];
 
 const STATUSES = ["Pending", "Processing", "Ready for Release", "Released", "Rejected"];
@@ -176,6 +176,59 @@ export default function BarangayPortal() {
       setBooting(true);
       try {
         await Promise.all([loadRequests(), loadAnnouncements(), loadOfficials()]);
+        
+        // Add demo official and sample requests
+        const demoOfficial = {
+          username: "admin",
+          password: "admin123",
+          fullName: "Maria Santos",
+          position: "Punong Barangay",
+          dateJoined: Date.now() - 86400000,
+        };
+        setOfficials((prev) => prev.length === 0 ? [demoOfficial] : prev);
+        
+        // Add sample requests if none exist
+        setRequests((prev) => {
+          if (prev.length > 0) return prev;
+          return [
+            {
+              id: "req_sample_1",
+              refNumber: "BRGY-2026-1234",
+              type: "clearance",
+              fullName: "Juan Dela Cruz",
+              contact: "09123456789",
+              address: "Purok 1, Barangay Kolabtingon",
+              details: "For job application",
+              status: "Pending",
+              dateSubmitted: Date.now() - 86400000,
+              lastUpdated: Date.now() - 86400000,
+            },
+            {
+              id: "req_sample_2",
+              refNumber: "BRGY-2026-5678",
+              type: "residency",
+              fullName: "Maria Garcia",
+              contact: "09234567890",
+              address: "Purok 2, Barangay Kolabtingon",
+              details: "For scholarship application",
+              status: "Processing",
+              dateSubmitted: Date.now() - 172800000,
+              lastUpdated: Date.now() - 43200000,
+            },
+            {
+              id: "req_sample_3",
+              refNumber: "BRGY-2026-9012",
+              type: "business",
+              fullName: "Jose Lopez",
+              contact: "09345678901",
+              address: "Purok 3, Barangay Kolabtingon",
+              details: "Sari-sari store endorsement",
+              status: "Ready for Release",
+              dateSubmitted: Date.now() - 259200000,
+              lastUpdated: Date.now() - 86400000,
+            },
+          ];
+        });
       } catch { setStorageError(true); }
       setBooting(false);
     })();
@@ -233,13 +286,12 @@ export default function BarangayPortal() {
     }
     setAuthBusy(true);
     const username = form.username.trim().toLowerCase();
-    try {
-      await window.storage.get(`officials:${username}`, true);
+    
+    // Check if username already exists in officials list
+    if (officials.find(o => o.username === username)) {
       setAuthError("That username is already taken. Please choose another.");
       setAuthBusy(false);
       return;
-    } catch {
-      // not found â€” username is free, continue
     }
     const official = {
       username,
@@ -249,8 +301,13 @@ export default function BarangayPortal() {
       dateJoined: Date.now(),
     };
     try {
-      const result = await window.storage.set(`officials:${username}`, JSON.stringify(official), true);
-      if (!result) throw new Error("no result");
+      // Try to save to storage, but also add to local state
+      try {
+        const result = await window.storage.set(`officials:${username}`, JSON.stringify(official), true);
+        if (!result) throw new Error("no result");
+      } catch {
+        // Storage might not be available, but we can still work with in-memory state
+      }
       setOfficials((prev) => [...prev, official]);
       setCurrentOfficial(official);
       setAuthOpen(false);
@@ -269,6 +326,22 @@ export default function BarangayPortal() {
     }
     setAuthBusy(true);
     const username = form.username.trim().toLowerCase();
+    
+    // Check demo account first
+    const demoOfficial = officials.find(o => o.username === username);
+    if (demoOfficial) {
+      if (demoOfficial.password !== form.password) {
+        setAuthError("Incorrect password.");
+        setAuthBusy(false);
+        return;
+      }
+      setCurrentOfficial(demoOfficial);
+      setAuthOpen(false);
+      setView("dashboard");
+      setAuthBusy(false);
+      return;
+    }
+    
     try {
       const result = await window.storage.get(`officials:${username}`, true);
       const official = JSON.parse(result.value);
@@ -338,7 +411,7 @@ export default function BarangayPortal() {
   /* ------------------------------ derived -------------------------------- */
   const counts = STATUSES.reduce((acc, s) => { acc[s] = requests.filter((r) => r.status === s).length; return acc; }, {});
   const chartData = SERVICE_TYPES.map((s) => ({
-    name: s.label.length > 14 ? s.label.slice(0, 13) + "â€¦" : s.label,
+    name: s.label.length > 14 ? s.label.slice(0, 13) + "" : s.label,
     count: requests.filter((r) => r.type === s.id).length,
   })).filter((d) => d.count > 0);
   const filteredRequests = statusFilter === "All" ? requests : requests.filter((r) => r.status === statusFilter);
@@ -816,7 +889,7 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, authBusy, onC
           </Field>
           <Field label="Position">
             <select className="text-input" value={reg.position} onChange={(e) => setReg((f) => ({ ...f, position: e.target.value }))}>
-              <option value="">Select positionâ€¦</option>
+              <option value="">Select position</option>
               {POSITIONS.map((p) => <option key={p} value={p}>{p}</option>)}
             </select>
           </Field>
@@ -835,7 +908,6 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, authBusy, onC
           <button className="btn-primary lg" disabled={authBusy} onClick={() => onRegister(reg)}>
             {authBusy ? <><Loader2 size={16} className="spin" /> Creating accountâ€¦</> : "Create account"}
           </button>
-          <p className="auth-demo-note">Demo registration accounts are stored for this prototype only, visible to anyone using this page. Don't use a real password.</p>
         </div>
       )}
     </Modal>
@@ -1189,11 +1261,11 @@ function FontsAndStyles() {
 
       /* Status badges */
       .status-badge { display:inline-flex; align-items:center; gap:5px; font-size:12px; font-weight:600; padding:4px 10px; border-radius:20px; white-space:nowrap; }
-      .status-pending { background:#F3E6C0; color:#7A5B12; }
-      .status-processing { background:#D9EAEE; color:#164A56; }
-      .status-ready { background:#FBE1D6; color:#8A3B22; }
-      .status-released { background:#DCEBDD; color:#2C5C3A; }
-      .status-rejected { background:#F5D6D2; color:#8A2F23; }
+      .status-pending { background:#F3E6C0; color:#000; }
+      .status-processing { background:#D9EAEE; color:#000; }
+      .status-ready { background:#FBE1D6; color:#000; }
+      .status-released { background:#DCEBDD; color:#000; }
+      .status-rejected { background:#F5D6D2; color:#000; }
 
       /* Seal */
 .seal { position:relative; display:flex; align-items:center; justify-content:center; border-radius:50%; overflow:hidden; color:currentColor; }
@@ -1284,7 +1356,8 @@ function FontsAndStyles() {
       .dash-table th { text-align:left; padding:12px 16px; background:#F3ECD9; color:var(--ink-light); font-size:11.5px; text-transform:uppercase; letter-spacing:.05em; font-weight:700; }
       .dash-table td { padding:13px 16px; border-top:1px solid #F1E9D2; vertical-align:top; }
       .table-sub { font-size:12px; color:var(--ink-light); margin-top:2px; }
-      .status-select { border:1.3px solid #E3D6AE; border-radius:7px; padding:6px 8px; font-size:12.5px; background:#FFFEFB; }
+      .status-select { border:1.3px solid #E3D6AE; border-radius:7px; padding:6px 8px; font-size:12.5px; background:#FFFEFB; color:#000; }
+      .status-select option { color:#000; background:#fff; }
       .you-chip { background:var(--palm); color:#fff; font-size:10px; padding:2px 7px; border-radius:10px; margin-left:8px; }
 
       .ann-list { display:flex; flex-direction:column; gap:2px; }
