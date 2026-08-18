@@ -107,10 +107,12 @@ export default function BarangayPortal() {
   const [requests, setRequests] = useState([]);
   const [announcements, setAnnouncements] = useState([]);
   const [officials, setOfficials] = useState([]);
+  const [pendingOfficials, setPendingOfficials] = useState([]);
 
   const [authOpen, setAuthOpen] = useState(false);
   const [authTab, setAuthTab] = useState("login");
   const [authError, setAuthError] = useState("");
+  const [regMessage, setRegMessage] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
   const [currentOfficial, setCurrentOfficial] = useState(null);
 
@@ -167,8 +169,10 @@ export default function BarangayPortal() {
           return r ? JSON.parse(r.value) : null;
         } catch { return null; }
       }));
-      setOfficials(items.filter(Boolean).sort((a, b) => a.dateJoined - b.dateJoined));
-    } catch { setOfficials([]); }
+      const valid = items.filter(Boolean).map(o => ({ ...o, status: o.status || "approved" }));
+      setOfficials(valid.filter(o => o.status === "approved").sort((a, b) => a.dateJoined - b.dateJoined));
+      setPendingOfficials(valid.filter(o => o.status === "pending").sort((a, b) => a.dateJoined - b.dateJoined));
+    } catch { setOfficials([]); setPendingOfficials([]); }
   }, []);
 
   useEffect(() => {
@@ -177,15 +181,25 @@ export default function BarangayPortal() {
       try {
         await Promise.all([loadRequests(), loadAnnouncements(), loadOfficials()]);
         
-        // Add demo official and sample requests
+        // Ensure the demo admin exists in storage so it can approve registrations
         const demoOfficial = {
           username: "admin",
           password: "admin123",
           fullName: "Maria Santos",
           position: "Punong Barangay",
+          isAdmin: true,
+          status: "approved",
           dateJoined: Date.now() - 86400000,
         };
-        setOfficials((prev) => prev.length === 0 ? [demoOfficial] : prev);
+        try {
+          const existing = await window.storage.get(`officials:${demoOfficial.username}`, true);
+          if (!existing) {
+            await window.storage.set(`officials:${demoOfficial.username}`, JSON.stringify(demoOfficial), true);
+          }
+        } catch {}
+        setOfficials((prev) =>
+          prev.some((o) => o.username === demoOfficial.username) ? prev : [...prev, demoOfficial]
+        );
         
         // Add sample requests if none exist
         setRequests((prev) => {
@@ -276,6 +290,7 @@ export default function BarangayPortal() {
 
   async function handleRegister(form) {
     setAuthError("");
+    setRegMessage("");
     if (!form.username.trim() || !form.password || !form.fullName.trim() || !form.position) {
       setAuthError("Please complete every field.");
       return;
@@ -287,8 +302,8 @@ export default function BarangayPortal() {
     setAuthBusy(true);
     const username = form.username.trim().toLowerCase();
     
-    // Check if username already exists in officials list
-    if (officials.find(o => o.username === username)) {
+    // Check if username already exists (approved or pending)
+    if (officials.find(o => o.username === username) || pendingOfficials.find(o => o.username === username)) {
       setAuthError("That username is already taken. Please choose another.");
       setAuthBusy(false);
       return;
@@ -298,22 +313,16 @@ export default function BarangayPortal() {
       password: form.password,
       fullName: form.fullName.trim(),
       position: form.position,
+      status: "pending",
       dateJoined: Date.now(),
     };
     try {
-      // Try to save to storage, but also add to local state
-      try {
-        const result = await window.storage.set(`officials:${username}`, JSON.stringify(official), true);
-        if (!result) throw new Error("no result");
-      } catch {
-        // Storage might not be available, but we can still work with in-memory state
-      }
-      setOfficials((prev) => [...prev, official]);
-      setCurrentOfficial(official);
-      setAuthOpen(false);
-      setView("dashboard");
+      const result = await window.storage.set(`officials:${username}`, JSON.stringify(official), true);
+      if (!result) throw new Error("no result");
+      setPendingOfficials((prev) => [...prev, official]);
+      setRegMessage("Your registration has been submitted. An admin must approve your account before you can log in.");
     } catch {
-      setAuthError("Could not create your account. Please try again.");
+      setAuthError("Could not submit your registration. Please try again.");
     }
     setAuthBusy(false);
   }
@@ -330,6 +339,16 @@ export default function BarangayPortal() {
     // Check demo account first
     const demoOfficial = officials.find(o => o.username === username);
     if (demoOfficial) {
+      if (demoOfficial.status === "pending") {
+        setAuthError("Your account is still waiting for admin approval.");
+        setAuthBusy(false);
+        return;
+      }
+      if (demoOfficial.status === "rejected") {
+        setAuthError("Your account was rejected. Please contact the barangay office.");
+        setAuthBusy(false);
+        return;
+      }
       if (demoOfficial.password !== form.password) {
         setAuthError("Incorrect password.");
         setAuthBusy(false);
@@ -345,6 +364,16 @@ export default function BarangayPortal() {
     try {
       const result = await window.storage.get(`officials:${username}`, true);
       const official = JSON.parse(result.value);
+      if (official.status === "pending") {
+        setAuthError("Your account is still waiting for admin approval.");
+        setAuthBusy(false);
+        return;
+      }
+      if (official.status === "rejected") {
+        setAuthError("Your account was rejected. Please contact the barangay office.");
+        setAuthBusy(false);
+        return;
+      }
       if (official.password !== form.password) {
         setAuthError("Incorrect password.");
         setAuthBusy(false);
@@ -363,6 +392,27 @@ export default function BarangayPortal() {
     setCurrentOfficial(null);
     setView("public");
     setDashTab("overview");
+  }
+
+  async function approveOfficial(username) {
+    const target = pendingOfficials.find((o) => o.username === username);
+    if (!target) return;
+    const updated = { ...target, status: "approved" };
+    setPendingOfficials((prev) => prev.filter((o) => o.username !== username));
+    setOfficials((prev) => [...prev, updated].sort((a, b) => a.dateJoined - b.dateJoined));
+    try {
+      await window.storage.set(`officials:${username}`, JSON.stringify(updated), true);
+    } catch { loadOfficials(); }
+  }
+
+  async function rejectOfficial(username) {
+    const target = pendingOfficials.find((o) => o.username === username);
+    if (!target) return;
+    const updated = { ...target, status: "rejected" };
+    setPendingOfficials((prev) => prev.filter((o) => o.username !== username));
+    try {
+      await window.storage.set(`officials:${username}`, JSON.stringify(updated), true);
+    } catch { loadOfficials(); }
   }
 
   async function updateStatus(id, status) {
@@ -411,7 +461,7 @@ export default function BarangayPortal() {
   /* ------------------------------ derived -------------------------------- */
   const counts = STATUSES.reduce((acc, s) => { acc[s] = requests.filter((r) => r.status === s).length; return acc; }, {});
   const chartData = SERVICE_TYPES.map((s) => ({
-    name: s.label.length > 14 ? s.label.slice(0, 13) + "" : s.label,
+    name: s.label,
     count: requests.filter((r) => r.type === s.id).length,
   })).filter((d) => d.count > 0);
   const filteredRequests = statusFilter === "All" ? requests : requests.filter((r) => r.status === statusFilter);
@@ -462,6 +512,9 @@ export default function BarangayPortal() {
           postAnnouncement={postAnnouncement}
           deleteAnnouncement={deleteAnnouncement}
           officials={officials}
+          pendingOfficials={pendingOfficials}
+          approveOfficial={approveOfficial}
+          rejectOfficial={rejectOfficial}
         />
       )}
 
@@ -471,8 +524,10 @@ export default function BarangayPortal() {
           setAuthTab={setAuthTab}
           authError={authError}
           setAuthError={setAuthError}
+          regMessage={regMessage}
+          setRegMessage={setRegMessage}
           authBusy={authBusy}
-          onClose={() => { setAuthOpen(false); setAuthError(""); }}
+          onClose={() => { setAuthOpen(false); setAuthError(""); setRegMessage(""); }}
           onLogin={handleLogin}
           onRegister={handleRegister}
         />
@@ -852,17 +907,17 @@ function TicketStub({ ticket, onDismiss }) {
 /* ---------------------------------------------------------------------- */
 /*  Auth modal (login / register)                                         */
 /* ---------------------------------------------------------------------- */
-function AuthModal({ authTab, setAuthTab, authError, setAuthError, authBusy, onClose, onLogin, onRegister }) {
+function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, setRegMessage, authBusy, onClose, onLogin, onRegister }) {
   const [login, setLogin] = useState({ username: "", password: "" });
   const [reg, setReg] = useState({ username: "", password: "", confirm: "", fullName: "", position: "" });
 
   return (
     <Modal onClose={onClose} width={420}>
       <div className="auth-tabs">
-        <button className={authTab === "login" ? "auth-tab active" : "auth-tab"} onClick={() => { setAuthTab("login"); setAuthError(""); }}>
+        <button className={authTab === "login" ? "auth-tab active" : "auth-tab"} onClick={() => { setAuthTab("login"); setAuthError(""); setRegMessage(""); }}>
           <LogIn size={15} /> Log in
         </button>
-        <button className={authTab === "register" ? "auth-tab active" : "auth-tab"} onClick={() => { setAuthTab("register"); setAuthError(""); }}>
+        <button className={authTab === "register" ? "auth-tab active" : "auth-tab"} onClick={() => { setAuthTab("register"); setAuthError(""); setRegMessage(""); }}>
           <UserPlus size={15} /> Register
         </button>
       </div>
@@ -880,35 +935,33 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, authBusy, onC
           <button className="btn-primary lg" disabled={authBusy} onClick={() => onLogin(login)}>
             {authBusy ? <><Loader2 size={16} className="spin" /> Logging inâ€¦</> : "Log in"}
           </button>
-          <p className="auth-demo-note">Demo login this is a frontend prototype. Please don't use a real password.</p>
         </div>
       ) : (
-        <div className="auth-form">
-          <Field label="Full name">
-            <input className="text-input" value={reg.fullName} onChange={(e) => setReg((f) => ({ ...f, fullName: e.target.value }))} />
-          </Field>
-          <Field label="Position">
-            <select className="text-input" value={reg.position} onChange={(e) => setReg((f) => ({ ...f, position: e.target.value }))}>
-              <option value="">Select position</option>
-              {POSITIONS.map((p) => <option key={p} value={p}>{p}</option>)}
-            </select>
-          </Field>
-          <Field label="Username">
-            <input className="text-input" value={reg.username} onChange={(e) => setReg((f) => ({ ...f, username: e.target.value }))} />
-          </Field>
-          <div className="field-row">
+          <div className="auth-form">
+            <Field label="Full name">
+              <input className="text-input" value={reg.fullName} onChange={(e) => setReg((f) => ({ ...f, fullName: e.target.value }))} />
+            </Field>
+            <Field label="Position">
+              <select className="text-input" value={reg.position} onChange={(e) => setReg((f) => ({ ...f, position: e.target.value }))}>
+                <option value="">Select position</option>
+                {POSITIONS.map((p) => <option key={p} value={p}>{p}</option>)}
+              </select>
+            </Field>
+            <Field label="Username">
+              <input className="text-input" value={reg.username} onChange={(e) => setReg((f) => ({ ...f, username: e.target.value }))} />
+            </Field>
             <Field label="Password">
               <input type="password" className="text-input" value={reg.password} onChange={(e) => setReg((f) => ({ ...f, password: e.target.value }))} />
             </Field>
             <Field label="Confirm password">
               <input type="password" className="text-input" value={reg.confirm} onChange={(e) => setReg((f) => ({ ...f, confirm: e.target.value }))} />
             </Field>
+            {authError && <p className="form-error">{authError}</p>}
+            {regMessage && <p className="form-success">{regMessage}</p>}
+            <button className="btn-primary lg" disabled={authBusy} onClick={() => onRegister(reg)}>
+              {authBusy ? <><Loader2 size={16} className="spin" /> Submittingâ€¦</> : "Create account"}
+            </button>
           </div>
-          {authError && <p className="form-error">{authError}</p>}
-          <button className="btn-primary lg" disabled={authBusy} onClick={() => onRegister(reg)}>
-            {authBusy ? <><Loader2 size={16} className="spin" /> Creating accountâ€¦</> : "Create account"}
-          </button>
-        </div>
       )}
     </Modal>
   );
@@ -921,6 +974,7 @@ function Dashboard({
   currentOfficial, handleLogout, dashTab, setDashTab, setView,
   requests, counts, chartData, statusFilter, setStatusFilter, filteredRequests, updateStatus,
   announcements, annForm, setAnnForm, annBusy, postAnnouncement, deleteAnnouncement, officials,
+  pendingOfficials, approveOfficial, rejectOfficial,
 }) {
   const total = requests.length;
   const inProgress = counts["Processing"] + counts["Ready for Release"];
@@ -963,6 +1017,9 @@ function Dashboard({
       </aside>
 
       <main className="dash-main">
+        <div className="dash-topbar">
+          <button className="btn-primary sm" onClick={handleLogout}><LogOut size={15} /> Exit dashboard</button>
+        </div>
         {dashTab === "overview" && (
         
           <>
@@ -982,7 +1039,7 @@ function Dashboard({
                   <ResponsiveContainer>
                     <BarChart data={chartData} margin={{ top: 8, right: 8, left: -20, bottom: 8 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#E5DCC4" />
-                      <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#55504A" }} interval={0} angle={-20} textAnchor="end" height={60} />
+                      <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#55504A" }} interval={0} angle={-20} textAnchor="end" height={95} />
                       <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#55504A" }} />
                       <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #D9B872" }} />
                       <Bar dataKey="count" fill="#163B44" radius={[4, 4, 0, 0]} />
@@ -1094,6 +1151,29 @@ function Dashboard({
         {dashTab === "officials" && (
           <>
             <h2 className="dash-title">Officials directory</h2>
+            {currentOfficial.isAdmin && (
+              <div className="dash-panel">
+                <h3>Pending approvals</h3>
+                {pendingOfficials.length === 0 ? (
+                  <p className="empty-note">No registrations waiting for approval.</p>
+                ) : (
+                  <div className="pending-list">
+                    {pendingOfficials.map((o) => (
+                      <div key={o.username} className="pending-row">
+                        <div className="pending-info">
+                          <div className="official-name">{o.fullName}</div>
+                          <div className="table-sub">{o.position} &middot; @{o.username} &middot; applied {fmtDate(o.dateJoined)}</div>
+                        </div>
+                        <div className="pending-actions">
+                          <button className="btn-primary sm" onClick={() => approveOfficial(o.username)}><CheckCircle2 size={14} /> Approve</button>
+                          <button className="icon-btn danger" onClick={() => rejectOfficial(o.username)} aria-label="Reject"><X size={15} /></button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             <div className="table-wrap">
               <table className="dash-table">
                 <thead><tr><th>Name</th><th>Position</th><th>Username</th><th>Joined</th></tr></thead>
@@ -1234,6 +1314,7 @@ function FontsAndStyles() {
       .text-input:focus { border-color:var(--teal); }
       .mono-input { font-family:'JetBrains Mono', monospace; }
       .form-error { color:var(--seal-dark); font-size:13px; margin:-6px 0 14px; }
+      .form-success { color:var(--palm); font-size:13px; line-height:1.5; margin:-6px 0 14px; }
 
       .ticket-slot { position:sticky; top:90px; }
       .ticket-placeholder { border:1.5px dashed #D9B872; border-radius:14px; padding:36px 24px; text-align:center; color:var(--manila-dark); display:flex; flex-direction:column; align-items:center; gap:12px; }
@@ -1329,6 +1410,7 @@ function FontsAndStyles() {
       .dash-user-name { font-size:12.5px; font-weight:600; }
       .dash-user-role { font-size:11px; color:#B9CBCE; }
       .dash-main { flex:1; padding:32px 36px; min-width:0; }
+      .dash-topbar { display:flex; justify-content:flex-end; margin-bottom:8px; }
       .dash-title { font-size:24px; color:var(--teal); margin-bottom:20px; }
 
       .stat-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:14px; margin-bottom:26px; }
@@ -1366,6 +1448,11 @@ function FontsAndStyles() {
       .ann-row-title { font-weight:600; font-size:14px; margin-bottom:3px; }
       .icon-btn { background:none; border:none; padding:6px; border-radius:7px; color:var(--ink-light); flex-shrink:0; }
       .icon-btn.danger:hover { background:#F5D6D2; color:var(--seal-dark); }
+
+      .pending-list { display:flex; flex-direction:column; gap:10px; }
+      .pending-row { display:flex; justify-content:space-between; align-items:center; gap:14px; padding:12px 14px; border:1px solid #E3D6AE; border-radius:10px; background:#FFFEFB; }
+      .pending-info { min-width:0; }
+      .pending-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
     `}</style>
   );
 }
