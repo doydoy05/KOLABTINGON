@@ -5,6 +5,10 @@ from urllib.error import HTTPError, URLError
 import json
 import os
 import sqlite3
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 DB_PATH = os.path.join(os.path.dirname(__file__), 'storage.db')
 HF_MODEL = os.environ.get('HF_MODEL', 'meta-llama/Llama-2-7b-chat-hf')
@@ -93,7 +97,10 @@ class StorageHandler(BaseHTTPRequestHandler):
             except Exception:
                 return None, str(exc)
         except URLError as exc:
-            return None, str(exc)
+            error_msg = str(exc)
+            if 'No address associated with hostname' in error_msg or 'Name or service not known' in error_msg:
+                return None, 'Network connection issue: Cannot reach Hugging Face API. Please check your internet connection or use a local Llama model instead.'
+            return None, f'Network error: {error_msg}'
 
     def _call_local_llama_model(self, prompt):
         if LOCAL_LLAMA is None:
