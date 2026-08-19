@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Menu, X, FileCheck2, Receipt, HeartHandshake, Home, Briefcase, BadgeCheck,
   AlertCircle, MessageSquare, Search, ShieldCheck, LogIn, UserPlus, LogOut,
-  ClipboardList, Megaphone, Users, LayoutDashboard, ChevronRight,
+  ClipboardList, Megaphone, Users, LayoutDashboard, ChevronRight, ChevronDown,
   CheckCircle2, Clock, PackageCheck, XCircle, Plus, Trash2, Building2, Star,
   MapPin, Phone, Mail, Loader2, Pin as PinIcon, Settings, KeyRound, Mail as MailIcon,
+  MessageSquareHeart, Send, EyeOff, Camera,
 } from "lucide-react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -57,6 +58,99 @@ function genId(prefix) {
 function fmtDate(ts) {
   if (!ts) return "”";
   return new Date(ts).toLocaleString("en-PH", { dateStyle: "medium", timeStyle: "short" });
+}
+
+/* --------------------------- security helpers --------------------------- */
+const pwEncoder = new TextEncoder();
+
+function bufToBase64(buf) {
+  let bin = "";
+  const bytes = new Uint8Array(buf);
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+async function generateSalt() {
+  return bufToBase64(crypto.getRandomValues(new Uint8Array(16)));
+}
+
+async function hashPassword(password, saltB64) {
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", pwEncoder.encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: base64ToBytes(saltB64), iterations: 100000, hash: "SHA-256" },
+    keyMaterial, 256
+  );
+  return bufToBase64(bits);
+}
+
+function apiHeaders(extra = {}) {
+  const headers = { ...extra };
+  try {
+    const token = localStorage.getItem("bportal_token");
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+  } catch {}
+  return headers;
+}
+
+async function apiPost(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: apiHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  const payload = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, ...payload };
+}
+
+async function apiGet(path) {
+  const res = await fetch(path, { headers: apiHeaders() });
+  const payload = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, ...payload };
+}
+
+/* --------------------------- photo helpers ------------------------------ */
+function resizeImage(file, maxSize = 160) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.85));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function OfficialAvatar({ official, sm }) {
+  if (official && official.photo) {
+    return <img src={official.photo} alt="" className={`official-avatar photo${sm ? " sm" : ""}`} />;
+  }
+  return (
+    <div className={`official-avatar${sm ? " sm" : ""}`}>
+      {(official && official.fullName ? official.fullName.split(" ").map((p) => p[0]).slice(0, 2).join("") : "?")}
+    </div>
+  );
 }
 
 /* ---------------------------------------------------------------------- */
@@ -121,12 +215,17 @@ export default function BarangayPortal() {
   const [trackInput, setTrackInput] = useState("");
   const [trackResult, setTrackResult] = useState(undefined); // undefined = not searched, null = not found
 
-  const [reqForm, setReqForm] = useState({ type: "", fullName: "", contact: "", address: "", details: "" });
+  const [reqForm, setReqForm] = useState({ type: "", fullName: "", contact: "", address: "", details: "", comment: "" });
   const [reqBusy, setReqBusy] = useState(false);
   const [reqError, setReqError] = useState("");
   const [tickets, setTickets] = useState([]);
 
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackList, setFeedbackList] = useState([]);
+  const [publicRating, setPublicRating] = useState({ count: 0, average: 0 });
+
   const [dashTab, setDashTab] = useState("overview");
+  const [forcePassword, setForcePassword] = useState(false);
   const [statusFilter, setStatusFilter] = useState("All");
   const [annForm, setAnnForm] = useState({ title: "", body: "" });
   const [annBusy, setAnnBusy] = useState(false);
@@ -176,78 +275,55 @@ export default function BarangayPortal() {
     } catch { setOfficials([]); setPendingOfficials([]); }
   }, []);
 
+  const loadFeedback = useCallback(async () => {
+    try {
+      const list = await window.storage.list("feedback:", true);
+      const keys = list && list.keys ? list.keys : [];
+      const items = await Promise.all(keys.map(async (k) => {
+        try {
+          const r = await window.storage.get(k, true);
+          return r ? JSON.parse(r.value) : null;
+        } catch { return null; }
+      }));
+      setFeedbackList(items.filter(Boolean).sort((a, b) => b.dateSubmitted - a.dateSubmitted));
+    } catch { setFeedbackList([]); }
+  }, []);
+
+  const loadPublicRating = useCallback(async () => {
+    try {
+      const res = await apiGet("/api/rating");
+      if (res.ok) setPublicRating({ count: res.count || 0, average: res.average || 0 });
+    } catch { /* keep last known value */ }
+  }, []);
+
   useEffect(() => {
     (async () => {
       setBooting(true);
       try {
-        await Promise.all([loadRequests(), loadAnnouncements(), loadOfficials()]);
-        
-        // Ensure the demo admin exists in storage so it can approve registrations
-        const demoOfficial = {
-          username: "admin",
-          password: "admin123",
-          fullName: "Maria Santos",
-          position: "Punong Barangay",
-          isAdmin: true,
-          status: "approved",
-          dateJoined: Date.now() - 86400000,
-        };
-        try {
-          const existing = await window.storage.get(`officials:${demoOfficial.username}`, true);
-          if (!existing) {
-            await window.storage.set(`officials:${demoOfficial.username}`, JSON.stringify(demoOfficial), true);
-          }
-        } catch {}
-        setOfficials((prev) =>
-          prev.some((o) => o.username === demoOfficial.username) ? prev : [...prev, demoOfficial]
-        );
-        
-        // Add sample requests if none exist
-        setRequests((prev) => {
-          if (prev.length > 0) return prev;
-          return [
-            {
-              id: "req_sample_1",
-              refNumber: "BRGY-2026-1234",
-              type: "clearance",
-              fullName: "Juan Dela Cruz",
-              contact: "09123456789",
-              address: "Purok 1, Barangay Kolabtingon",
-              details: "For job application",
-              status: "Pending",
-              dateSubmitted: Date.now() - 86400000,
-              lastUpdated: Date.now() - 86400000,
-            },
-            {
-              id: "req_sample_2",
-              refNumber: "BRGY-2026-5678",
-              type: "residency",
-              fullName: "Maria Garcia",
-              contact: "09234567890",
-              address: "Purok 2, Barangay Kolabtingon",
-              details: "For scholarship application",
-              status: "Processing",
-              dateSubmitted: Date.now() - 172800000,
-              lastUpdated: Date.now() - 43200000,
-            },
-            {
-              id: "req_sample_3",
-              refNumber: "BRGY-2026-9012",
-              type: "business",
-              fullName: "Jose Lopez",
-              contact: "09345678901",
-              address: "Purok 3, Barangay Kolabtingon",
-              details: "Sari-sari store endorsement",
-              status: "Ready for Release",
-              dateSubmitted: Date.now() - 259200000,
-              lastUpdated: Date.now() - 86400000,
-            },
-          ];
-        });
+        let loggedIn = false;
+        const token = localStorage.getItem("bportal_token");
+        if (token) {
+          try {
+            const res = await apiGet("/api/session");
+            if (res.ok) {
+              setCurrentOfficial(res.official);
+              loggedIn = true;
+            } else {
+              localStorage.removeItem("bportal_token");
+            }
+          } catch { /* keep session attempt non-fatal */ }
+        }
+        await Promise.all([
+          loadAnnouncements(),
+          loadOfficials(),
+          loadPublicRating(),
+          loggedIn ? loadRequests() : Promise.resolve(),
+          loggedIn ? loadFeedback() : Promise.resolve(),
+        ]);
       } catch { setStorageError(true); }
       setBooting(false);
     })();
-  }, [loadRequests, loadAnnouncements, loadOfficials]);
+  }, [loadRequests, loadAnnouncements, loadOfficials, loadFeedback, loadPublicRating]);
 
   /* Poll the backend while a ticket is showing so status updates from staff appear live */
   useEffect(() => {
@@ -256,8 +332,8 @@ export default function BarangayPortal() {
     const poll = async () => {
       const latest = await Promise.all(tickets.map(async (t) => {
         try {
-          const r = await window.storage.get(`requests:${t.id}`, true);
-          return r ? JSON.parse(r.value) : t;
+          const res = await apiGet(`/api/track?ref=${encodeURIComponent(t.refNumber)}`);
+          return res.ok && res.request ? res.request : t;
         } catch { return t; }
       }));
       if (cancelled) return;
@@ -285,6 +361,7 @@ export default function BarangayPortal() {
       contact: reqForm.contact.trim(),
       address: reqForm.address.trim(),
       details: reqForm.details.trim(),
+      comment: reqForm.comment.trim(),
       status: "Pending",
       dateSubmitted: Date.now(),
       lastUpdated: Date.now(),
@@ -294,7 +371,7 @@ export default function BarangayPortal() {
       if (!result) throw new Error("Storage returned no result");
       setRequests((prev) => [payload, ...prev]);
       setTickets((prev) => [payload, ...prev]);
-      setReqForm({ type: "", fullName: "", contact: "", address: "", details: "" });
+      setReqForm({ type: "", fullName: "", contact: "", address: "", details: "", comment: "" });
       setReqBusy(false);
       return true;
     } catch {
@@ -304,23 +381,34 @@ export default function BarangayPortal() {
     }
   }
 
+  async function handleSubmitFeedback(message, rating) {
+    const id = genId("fbk");
+    const payload = {
+      id,
+      rating: rating || 0,
+      message: message.trim(),
+      dateSubmitted: Date.now(),
+    };
+    try {
+      const result = await window.storage.set(`feedback:${id}`, JSON.stringify(payload), true);
+      if (!result) throw new Error("Storage returned no result");
+      setFeedbackList((prev) => [payload, ...prev]);
+      loadPublicRating();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function handleTrack() {
     const ref = trackInput.trim().toUpperCase();
     if (!ref) return;
-    const found = requests.find((r) => r.refNumber.toUpperCase() === ref);
-    if (found) { setTrackResult(found); return; }
     try {
-      const list = await window.storage.list("requests:", true);
-      const keys = list && list.keys ? list.keys : [];
-      for (const k of keys) {
-        const r = await window.storage.get(k, true);
-        if (!r) continue;
-        const item = JSON.parse(r.value);
-        if (item.refNumber && item.refNumber.toUpperCase() === ref) {
-          setRequests((prev) => (prev.some((x) => x.id === item.id) ? prev : [item, ...prev]));
-          setTrackResult(item);
-          return;
-        }
+      const res = await apiGet(`/api/track?ref=${encodeURIComponent(ref)}`);
+      if (res.ok && res.request) {
+        setTrackResult(res.request);
+        setRequests((prev) => (prev.some((x) => x.id === res.request.id) ? prev : [res.request, ...prev]));
+        return;
       }
     } catch { /* fall through to not-found */ }
     setTrackResult(null);
@@ -358,13 +446,17 @@ export default function BarangayPortal() {
       setAuthBusy(false);
       return;
     }
+    const salt = await generateSalt();
+    const passwordHash = await hashPassword(form.password, salt);
     const official = {
       username,
-      password: form.password,
       email,
       fullName: form.fullName.trim(),
       position: form.position,
       status: "pending",
+      salt,
+      passwordHash,
+      mustChangePassword: true,
       dateJoined: Date.now(),
     };
     try {
@@ -385,53 +477,39 @@ export default function BarangayPortal() {
       return;
     }
     setAuthBusy(true);
-    const identifier = form.username.trim().toLowerCase();
-    
-    const matchOfficial = async () => {
-      const local = officials.find(o => o.username === identifier || (o.email && o.email.toLowerCase() === identifier));
-      if (local) return local;
-      try {
-        const list = await window.storage.list("officials:", true);
-        const keys = list && list.keys ? list.keys : [];
-        for (const k of keys) {
-          const r = await window.storage.get(k, true);
-          if (!r) continue;
-          const o = JSON.parse(r.value);
-          if (o.username === identifier || (o.email && o.email.toLowerCase() === identifier)) return o;
-        }
-      } catch { /* storage unavailable */ }
-      return undefined;
-    };
-    
-    const official = await matchOfficial();
-    if (!official) {
-      setAuthError("No account found with that username or Gmail.");
+    try {
+      const res = await apiPost("/api/login", {
+        identifier: form.username.trim().toLowerCase(),
+        password: form.password,
+      });
+      if (!res.ok) {
+        setAuthError(res.error || "Login failed.");
+        setAuthBusy(false);
+        return;
+      }
+      localStorage.setItem("bportal_token", res.token);
+      setCurrentOfficial(res.official);
+      setAuthOpen(false);
+      setView("dashboard");
+      setDashTab(res.official.mustChangePassword ? "settings" : "overview");
+      setForcePassword(!!res.official.mustChangePassword);
+      await Promise.all([loadRequests(), loadFeedback()]);
       setAuthBusy(false);
-      return;
-    }
-    if (official.status === "pending") {
-      setAuthError("Your account is still waiting for admin approval.");
+    } catch {
+      setAuthError("Could not reach the server. Please try again.");
       setAuthBusy(false);
-      return;
     }
-    if (official.status === "rejected") {
-      setAuthError("Your account was rejected. Please contact the barangay office.");
-      setAuthBusy(false);
-      return;
-    }
-    if (official.password !== form.password) {
-      setAuthError("Incorrect password.");
-      setAuthBusy(false);
-      return;
-    }
-    setCurrentOfficial(official);
-    setAuthOpen(false);
-    setView("dashboard");
-    setAuthBusy(false);
   }
 
   function handleLogout() {
+    const token = localStorage.getItem("bportal_token");
+    if (token) {
+      fetch("/api/logout", { method: "POST", headers: apiHeaders() }).catch(() => {});
+    }
+    localStorage.removeItem("bportal_token");
     setCurrentOfficial(null);
+    setRequests([]);
+    setFeedbackList([]);
     setView("public");
     setDashTab("overview");
   }
@@ -439,16 +517,58 @@ export default function BarangayPortal() {
   async function changePassword(currentPw, newPw) {
     if (!currentOfficial) return { ok: false, error: "You are not logged in." };
     if (!currentPw || !newPw) return { ok: false, error: "Please fill in every field." };
-    if (currentOfficial.password !== currentPw) return { ok: false, error: "Current password is incorrect." };
     if (newPw.length < 6) return { ok: false, error: "New password must be at least 6 characters." };
-    const updated = { ...currentOfficial, password: newPw };
     try {
-      await window.storage.set(`officials:${currentOfficial.username}`, JSON.stringify(updated), true);
-      setCurrentOfficial(updated);
-      setOfficials((prev) => prev.map((o) => (o.username === updated.username ? updated : o)));
+      const res = await apiPost("/api/change-password", { currentPw, newPw });
+      if (!res.ok) return { ok: false, error: res.error || "Could not update your password." };
+      setCurrentOfficial(res.official);
+      setOfficials((prev) => prev.map((o) => (o.username === res.official.username ? res.official : o)));
       return { ok: true };
     } catch {
       return { ok: false, error: "Could not update your password. Please try again." };
+    }
+  }
+
+  async function updateProfilePhoto(photo) {
+    if (!currentOfficial) return false;
+    try {
+      const res = await apiPost("/api/update-official", {
+        username: currentOfficial.username,
+        updates: { photo },
+      });
+      if (!res.ok) return false;
+      setCurrentOfficial(res.official);
+      setOfficials((prev) => prev.map((o) => (o.username === res.official.username ? res.official : o)));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function requestReset(identifier) {
+    if (!identifier.trim()) return { ok: false, error: "Enter your username or Gmail address." };
+    try {
+      const res = await apiPost("/api/reset-request", { identifier: identifier.trim().toLowerCase() });
+      if (!res.ok) return { ok: false, error: res.error || "Could not start a password reset. Please try again." };
+      return { ok: true, code: res.code };
+    } catch {
+      return { ok: false, error: "Could not start a password reset. Please try again." };
+    }
+  }
+
+  async function completeReset(identifier, code, newPw) {
+    if (!code || !newPw) return { ok: false, error: "Enter the reset code and a new password." };
+    if (newPw.length < 6) return { ok: false, error: "New password must be at least 6 characters." };
+    try {
+      const res = await apiPost("/api/reset-complete", {
+        identifier: identifier.trim().toLowerCase(),
+        code: code.trim(),
+        newPw,
+      });
+      if (!res.ok) return { ok: false, error: res.error || "Could not reset your password. Please try again." };
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not reset your password. Please try again." };
     }
   }
 
@@ -539,6 +659,8 @@ export default function BarangayPortal() {
           setAuthOpen={setAuthOpen}
           setAuthTab={setAuthTab}
           setTrackOpen={setTrackOpen}
+          setFeedbackOpen={setFeedbackOpen}
+          publicRating={publicRating}
           officials={officials}
           announcements={announcements}
           reqForm={reqForm}
@@ -575,6 +697,10 @@ export default function BarangayPortal() {
           approveOfficial={approveOfficial}
           rejectOfficial={rejectOfficial}
           changePassword={changePassword}
+          updateProfilePhoto={updateProfilePhoto}
+          forcePassword={forcePassword}
+          setForcePassword={setForcePassword}
+          feedback={feedbackList}
         />
       )}
 
@@ -590,6 +716,15 @@ export default function BarangayPortal() {
           onClose={() => { setAuthOpen(false); setAuthError(""); setRegMessage(""); }}
           onLogin={handleLogin}
           onRegister={handleRegister}
+          onRequestReset={requestReset}
+          onCompleteReset={completeReset}
+        />
+      )}
+
+      {feedbackOpen && (
+        <FeedbackModal
+          onClose={() => setFeedbackOpen(false)}
+          onSubmit={handleSubmitFeedback}
         />
       )}
 
@@ -629,13 +764,14 @@ export default function BarangayPortal() {
 /* ---------------------------------------------------------------------- */
 function PublicSite({
   booting, storageError, mobileMenuOpen, setMobileMenuOpen, scrollTo,
-  setAuthOpen, setAuthTab, setTrackOpen, officials, announcements,
+  setAuthOpen, setAuthTab, setTrackOpen, setFeedbackOpen, publicRating, officials, announcements,
   reqForm, setReqForm, reqBusy, reqError, setReqError, handleSubmitRequest, tickets, setTickets,
 }) {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
+  const avgRating = publicRating.average || 0;
   const [chatMessages, setChatMessages] = useState([
     {
       sender: "bot",
@@ -697,6 +833,26 @@ function PublicSite({
             </div>
           </div>
           <div className="header-actions">
+            <div className="header-feedback-row">
+              <button
+                className="header-feedback-btn"
+                onClick={() => setFeedbackOpen(true)}
+              >
+                <MessageSquareHeart size={15} />
+                <span>Feedback</span>
+              </button>
+              {publicRating.count > 0 && (
+                <span className="header-rating">
+                  Rating:
+                  <span className="header-rating-stars">
+                    {[1, 2, 3, 4, 5].map((n) => (
+                      <Star key={n} size={13} fill={n <= Math.round(avgRating) ? "currentColor" : "none"} />
+                    ))}
+                  </span>
+                  <strong>{avgRating.toFixed(1)}</strong>
+                </span>
+              )}
+            </div>
             <button
               className="btn-primary sm"
               onClick={() => {
@@ -715,6 +871,7 @@ function PublicSite({
             <button onClick={() => scrollTo("announcements")}>Announcements</button>
             <button onClick={() => scrollTo("officials")}>Officials</button>
             <button onClick={() => { setMobileMenuOpen(false); setTrackOpen(true); }}>Track a request</button>
+            <button onClick={() => { setMobileMenuOpen(false); setFeedbackOpen(true); }}>Send feedback</button>
             <button onClick={() => { setMobileMenuOpen(false); setAuthTab("login"); setAuthOpen(true); }}>Officials Login</button>
           </div>
         )}
@@ -829,7 +986,7 @@ function PublicSite({
             <div className="officials-grid">
               {officials.map((o) => (
                 <div key={o.username} className="official-card">
-                  <div className="official-avatar">{o.fullName.split(" ").map(p => p[0]).slice(0, 2).join("")}</div>
+                  <OfficialAvatar official={o} />
                   <div>
                     <div className="official-name">{o.fullName}</div>
                     <div className="official-position">{o.position}</div>
@@ -939,18 +1096,70 @@ function Seal({ size }) {
   );
 }
 
+function TypeOfRequestSelect({ reqForm, setReqForm }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+  const selected = SERVICE_TYPES.find((s) => s.id === reqForm.type);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  return (
+    <div className="type-select" ref={wrapRef}>
+      <button
+        type="button"
+        className="type-select-trigger"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className={selected ? "" : "type-select-placeholder"}>
+          {selected ? selected.label : "Select a request type"}
+        </span>
+        <ChevronDown size={16} className={`type-select-chev${open ? " open" : ""}`} />
+      </button>
+      {open && (
+        <div className="type-select-menu">
+          {SERVICE_TYPES.map((s) => (
+            <div key={s.id} className="type-option-wrap">
+              <button
+                type="button"
+                className={`type-option${s.id === reqForm.type ? " active" : ""}`}
+                onClick={() => {
+                  setReqForm((f) => ({ ...f, type: s.id }));
+                  if (s.id !== "other") setOpen(false);
+                }}
+              >
+                {s.label}
+              </button>
+              {s.id === "other" && reqForm.type === "other" && (
+                <div className="type-comment-row">
+                  <span>Comment:</span>
+                  <input
+                    className="text-input type-comment-input"
+                    value={reqForm.comment || ""}
+                    onChange={(e) => setReqForm((f) => ({ ...f, comment: e.target.value }))}
+                    placeholder="Describe your concern..."
+                  />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RequestFields({ reqForm, setReqForm, reqError, reqBusy, onSubmit }) {
   return (
     <>
       <Field label="Type of request">
-        <select
-          className="text-input"
-          value={reqForm.type}
-          onChange={(e) => setReqForm((f) => ({ ...f, type: e.target.value }))}
-        >
-          <option value="">Select a request type</option>
-          {SERVICE_TYPES.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
-        </select>
+        <TypeOfRequestSelect reqForm={reqForm} setReqForm={setReqForm} />
       </Field>
       <Field label="Full name">
         <input className="text-input" value={reqForm.fullName}
@@ -966,11 +1175,13 @@ function RequestFields({ reqForm, setReqForm, reqError, reqBusy, onSubmit }) {
             onChange={(e) => setReqForm((f) => ({ ...f, address: e.target.value }))} placeholder="Purok 3, Sitio Sampaguita" />
         </Field>
       </div>
-      <Field label="Details" hint="Purpose of the document, or describe your concern">
-        <textarea className="text-input" rows={4} value={reqForm.details}
-          onChange={(e) => setReqForm((f) => ({ ...f, details: e.target.value }))}
-          placeholder="e.g. For job application at..." />
-      </Field>
+      {reqForm.type !== "other" && (
+        <Field label="Details" hint="Purpose of the document, or describe your concern">
+          <textarea className="text-input" rows={4} value={reqForm.details}
+            onChange={(e) => setReqForm((f) => ({ ...f, details: e.target.value }))}
+            placeholder="e.g. For job application at..." />
+        </Field>
+      )}
       {reqError && <p className="form-error">{reqError}</p>}
       <button className="btn-primary lg" disabled={reqBusy} onClick={onSubmit}>
         {reqBusy ? <><Loader2 size={16} className="spin" /> Submitting&hellip;</> : <>Submit request <ChevronRight size={16} /></>}
@@ -1002,9 +1213,51 @@ function TicketStub({ ticket, onDismiss }) {
 /* ---------------------------------------------------------------------- */
 /*  Auth modal (login / register)                                         */
 /* ---------------------------------------------------------------------- */
-function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, setRegMessage, authBusy, onClose, onLogin, onRegister }) {
+function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, setRegMessage, authBusy, onClose, onLogin, onRegister, onRequestReset, onCompleteReset }) {
   const [login, setLogin] = useState({ username: "", password: "" });
   const [reg, setReg] = useState({ username: "", password: "", confirm: "", fullName: "", position: "", email: "" });
+  const [resetId, setResetId] = useState("");
+  const [resetCode, setResetCode] = useState("");
+  const [resetPw, setResetPw] = useState("");
+  const [resetConfirm, setResetConfirm] = useState("");
+  const [resetStep, setResetStep] = useState(1); // 1 = request code, 2 = enter code + new pw, 3 = done
+  const [resetMsg, setResetMsg] = useState("");
+  const [resetError, setResetError] = useState("");
+  const [resetBusy, setResetBusy] = useState(false);
+
+  const goReset = () => {
+    setAuthTab("reset");
+    setAuthError("");
+    setRegMessage("");
+    setResetId("");
+    setResetCode("");
+    setResetPw("");
+    setResetConfirm("");
+    setResetStep(1);
+    setResetMsg("");
+    setResetError("");
+  };
+
+  const handleSendCode = async () => {
+    setResetError("");
+    setResetBusy(true);
+    const res = await onRequestReset(resetId);
+    setResetBusy(false);
+    if (!res.ok) { setResetError(res.error); return; }
+    setResetStep(2);
+    setResetMsg(`Reset code ${res.code} — in production this would be emailed to you. Enter it below within 30 minutes.`);
+  };
+
+  const handleDoReset = async () => {
+    setResetError("");
+    if (resetPw !== resetConfirm) { setResetError("New passwords do not match."); return; }
+    setResetBusy(true);
+    const res = await onCompleteReset(resetId, resetCode.trim(), resetPw);
+    setResetBusy(false);
+    if (!res.ok) { setResetError(res.error); return; }
+    setResetStep(3);
+    setResetMsg("Your password has been reset. Log in with your new password.");
+  };
 
   return (
     <Modal onClose={onClose} width={420}>
@@ -1014,6 +1267,9 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, s
         </button>
         <button className={authTab === "register" ? "auth-tab active" : "auth-tab"} onClick={() => { setAuthTab("register"); setAuthError(""); setRegMessage(""); }}>
           <UserPlus size={15} /> Register
+        </button>
+        <button className={authTab === "reset" ? "auth-tab active" : "auth-tab"} onClick={() => goReset()}>
+          <KeyRound size={15} /> Reset
         </button>
       </div>
 
@@ -1027,10 +1283,53 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, s
               onKeyDown={(e) => e.key === "Enter" && onLogin(login)} />
           </Field>
           {authError && <p className="form-error">{authError}</p>}
+          {regMessage && <p className="form-success">{regMessage}</p>}
           <button className="btn-primary lg" disabled={authBusy} onClick={() => onLogin(login)}>
-            {authBusy ? <><Loader2 size={16} className="spin" /> Logging inâ€¦</> : "Log in"}
+            {authBusy ? <><Loader2 size={16} className="spin" /> Logging in&hellip;</> : "Log in"}
           </button>
+          <button className="auth-link" onClick={goReset}>Forgot your password?</button>
         </div>
+      ) : authTab === "reset" ? (
+        resetStep === 1 ? (
+          <div className="auth-form">
+            <h3 className="modal-title">Reset password</h3>
+            <p className="modal-sub">Enter your username or Gmail. We'll issue a reset code.</p>
+            <Field label="Username or Gmail">
+              <input className="text-input" value={resetId} onChange={(e) => setResetId(e.target.value)} />
+            </Field>
+            {resetError && <p className="form-error">{resetError}</p>}
+            <button className="btn-primary lg" disabled={resetBusy} onClick={handleSendCode}>
+              {resetBusy ? <><Loader2 size={16} className="spin" /> Sending&hellip;</> : <><Send size={16} /> Send reset code</>}
+            </button>
+            <button className="auth-link" onClick={() => { setAuthTab("login"); setAuthError(""); setRegMessage(""); }}>Back to log in</button>
+          </div>
+        ) : resetStep === 2 ? (
+          <div className="auth-form">
+            <h3 className="modal-title">Enter reset code</h3>
+            {resetMsg && <p className="form-success">{resetMsg}</p>}
+            <Field label="Reset code">
+              <input className="text-input mono-input" value={resetCode} onChange={(e) => setResetCode(e.target.value)} placeholder="6-digit code" />
+            </Field>
+            <Field label="New password">
+              <input type="password" className="text-input" value={resetPw} onChange={(e) => setResetPw(e.target.value)} />
+            </Field>
+            <Field label="Confirm new password">
+              <input type="password" className="text-input" value={resetConfirm} onChange={(e) => setResetConfirm(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleDoReset()} />
+            </Field>
+            {resetError && <p className="form-error">{resetError}</p>}
+            <button className="btn-primary lg" disabled={resetBusy} onClick={handleDoReset}>
+              {resetBusy ? <><Loader2 size={16} className="spin" /> Resetting&hellip;</> : <><KeyRound size={16} /> Reset password</>}
+            </button>
+            <button className="auth-link" onClick={() => { setResetStep(1); setResetError(""); setResetMsg(""); }}>Request a new code</button>
+          </div>
+        ) : (
+          <div className="auth-form">
+            <h3 className="modal-title">Password reset</h3>
+            {resetMsg && <p className="form-success">{resetMsg}</p>}
+            <button className="btn-primary lg" onClick={() => { setAuthTab("login"); setAuthError(""); setRegMessage(""); }}>Go to log in</button>
+          </div>
+        )
       ) : (
           <div className="auth-form">
             <Field label="Full name">
@@ -1048,7 +1347,7 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, s
             <Field label="Gmail address" hint="Your @gmail.com email">
               <input type="email" className="text-input" placeholder="name@gmail.com" value={reg.email} onChange={(e) => setReg((f) => ({ ...f, email: e.target.value }))} />
             </Field>
-            <Field label="Password">
+            <Field label="Password" hint="At least 6 characters">
               <input type="password" className="text-input" value={reg.password} onChange={(e) => setReg((f) => ({ ...f, password: e.target.value }))} />
             </Field>
             <Field label="Confirm password">
@@ -1057,9 +1356,85 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, s
             {authError && <p className="form-error">{authError}</p>}
             {regMessage && <p className="form-success">{regMessage}</p>}
             <button className="btn-primary lg" disabled={authBusy} onClick={() => onRegister(reg)}>
-              {authBusy ? <><Loader2 size={16} className="spin" /> Submittingâ€¦</> : "Create account"}
+              {authBusy ? <><Loader2 size={16} className="spin" /> Submitting&hellip;</> : "Create account"}
             </button>
           </div>
+      )}
+    </Modal>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  Feedback modal (anonymous)                                            */
+/* ---------------------------------------------------------------------- */
+function FeedbackModal({ onClose, onSubmit }) {
+  const [rating, setRating] = useState(0);
+  const [hover, setHover] = useState(0);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [sent, setSent] = useState(false);
+
+  const handleSend = async () => {
+    setError("");
+    if (!message.trim()) {
+      setError("Please write your feedback before sending.");
+      return;
+    }
+    setBusy(true);
+    const ok = await onSubmit(message, rating);
+    setBusy(false);
+    if (!ok) {
+      setError("Could not send your feedback. Please try again.");
+      return;
+    }
+    setSent(true);
+  };
+
+  return (
+    <Modal onClose={onClose} width={460}>
+      {sent ? (
+        <>
+          <h3 className="modal-title">Thank you!</h3>
+          <p className="modal-sub">Your feedback has been sent to the barangay staff anonymously.</p>
+          <div className="feedback-thanks"><CheckCircle2 size={44} color="var(--palm)" /></div>
+          <button className="btn-primary lg" style={{ width: "100%" }} onClick={onClose}>Close</button>
+        </>
+      ) : (
+        <>
+          <h3 className="modal-title">Feedback to staff</h3>
+          <p className="modal-sub">
+            Your feedback is <strong>anonymous</strong> &mdash; no name is recorded. Staff will see it on their dashboard.
+          </p>
+          <div className="feedback-stars">
+            {[1, 2, 3, 4, 5].map((n) => (
+              <button
+                key={n}
+                type="button"
+                className={`feedback-star${n <= (hover || rating) ? " active" : ""}`}
+                onClick={() => setRating(n)}
+                onMouseEnter={() => setHover(n)}
+                onMouseLeave={() => setHover(0)}
+                aria-label={`Rate ${n} star${n > 1 ? "s" : ""}`}
+              >
+                <Star size={26} fill={n <= (hover || rating) ? "currentColor" : "none"} />
+              </button>
+            ))}
+          </div>
+          <Field label="Your message">
+            <textarea
+              className="text-input"
+              rows={4}
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              placeholder="Share your experience or suggestions..."
+            />
+          </Field>
+          {error && <p className="form-error">{error}</p>}
+          <button className="btn-primary lg" disabled={busy} onClick={handleSend}>
+            {busy ? <><Loader2 size={16} className="spin" /> Sending&hellip;</> : <><Send size={16} /> Send feedback</>}
+          </button>
+        </>
       )}
     </Modal>
   );
@@ -1072,14 +1447,22 @@ function Dashboard({
   currentOfficial, handleLogout, dashTab, setDashTab, setView,
   requests, counts, chartData, statusFilter, setStatusFilter, filteredRequests, updateStatus,
   announcements, annForm, setAnnForm, annBusy, postAnnouncement, deleteAnnouncement, officials,
-  pendingOfficials, approveOfficial, rejectOfficial, changePassword,
+  pendingOfficials, approveOfficial, rejectOfficial, changePassword, updateProfilePhoto,
+  forcePassword, setForcePassword,
+  feedback,
 }) {
   const total = requests.length;
   const inProgress = counts["Processing"] + counts["Ready for Release"];
+  const avgRating = feedback.length
+    ? feedback.reduce((sum, f) => sum + (f.rating || 0), 0) / feedback.length
+    : 0;
   const [pwForm, setPwForm] = useState({ current: "", next: "", confirm: "" });
   const [pwMsg, setPwMsg] = useState("");
   const [pwError, setPwError] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
+  const photoInputRef = useRef(null);
+  const [photoMsg, setPhotoMsg] = useState("");
+  const [photoError, setPhotoError] = useState("");
 
   const handleChangePassword = async () => {
     setPwError("");
@@ -1091,9 +1474,35 @@ function Dashboard({
     if (result.ok) {
       setPwMsg("Password updated successfully.");
       setPwForm({ current: "", next: "", confirm: "" });
+      if (forcePassword) setForcePassword(false);
     } else {
       setPwError(result.error);
     }
+  };
+
+  const handlePhotoChange = async (e) => {
+    setPhotoError("");
+    setPhotoMsg("");
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { setPhotoError("Please choose an image file."); return; }
+    try {
+      const dataUrl = await resizeImage(file, 160);
+      const ok = await updateProfilePhoto(dataUrl);
+      if (ok) setPhotoMsg("Profile picture updated.");
+      else setPhotoError("Could not save your photo. Please try again.");
+    } catch {
+      setPhotoError("Could not read that image. Please try another.");
+    }
+  };
+
+  const handleRemovePhoto = async () => {
+    setPhotoError("");
+    setPhotoMsg("");
+    const ok = await updateProfilePhoto("");
+    if (ok) setPhotoMsg("Profile picture removed.");
+    else setPhotoError("Could not remove your photo. Please try again.");
   };
 
   return (
@@ -1116,6 +1525,10 @@ function Dashboard({
           <button className={dashTab === "announcements" ? "dash-nav-item active" : "dash-nav-item"} onClick={() => setDashTab("announcements")}>
             <Megaphone size={16} /> Announcements
           </button>
+          <button className={dashTab === "feedback" ? "dash-nav-item active" : "dash-nav-item"} onClick={() => setDashTab("feedback")}>
+            <MessageSquareHeart size={16} /> Feedback
+            {feedback.length > 0 && <span className="dash-nav-badge">{feedback.length}</span>}
+          </button>
           <button className={dashTab === "officials" ? "dash-nav-item active" : "dash-nav-item"} onClick={() => setDashTab("officials")}>
             <Users size={16} /> Officials
           </button>
@@ -1126,7 +1539,7 @@ function Dashboard({
         <div className="dash-sidebar-footer">
           <button className="btn-ghost sm" onClick={() => setView("public")}>View public site</button>
           <div className="dash-user">
-            <div className="official-avatar sm">{currentOfficial.fullName.split(" ").map(p => p[0]).slice(0, 2).join("")}</div>
+            <OfficialAvatar official={currentOfficial} sm />
             <div>
               <div className="dash-user-name">{currentOfficial.fullName}</div>
               <div className="dash-user-role">{currentOfficial.position}</div>
@@ -1149,6 +1562,8 @@ function Dashboard({
               <StatCard label="Pending" value={counts["Pending"]} Icon={Clock} tone="pending" />
               <StatCard label="In progress" value={inProgress} Icon={PackageCheck} tone="processing" />
               <StatCard label="Released" value={counts["Released"]} Icon={CheckCircle2} tone="released" />
+              <StatCard label="Feedback" value={feedback.length} Icon={MessageSquareHeart} tone="processing" />
+              <StatCard label="Avg rating" value={feedback.length ? avgRating.toFixed(1) : "—"} Icon={Star} tone="released" />
             </div>
             <div className="dash-panel">
               <h3>Requests by type</h3>
@@ -1214,6 +1629,7 @@ function Dashboard({
                           <div>{r.fullName}</div>
                           <div className="table-sub">{r.contact} Â· {r.address}</div>
                           {r.details && <div className="table-sub">"{r.details}"</div>}
+                          {r.comment && <div className="table-sub">Comment: "{r.comment}"</div>}
                         </td>
                         <td>{SERVICE_TYPES.find(s => s.id === r.type)?.label || "Other"}</td>
                         <td className="table-sub">{fmtDate(r.dateSubmitted)}</td>
@@ -1268,6 +1684,43 @@ function Dashboard({
           </>
         )}
 
+        {dashTab === "feedback" && (
+          <>
+            <h2 className="dash-title">Anonymous feedback</h2>
+            {feedback.length > 0 && (
+              <div className="dash-panel feedback-summary">
+                <span className="feedback-stars-read">
+                  {[1, 2, 3, 4, 5].map((n) => (
+                    <Star key={n} size={18} fill={n <= Math.round(avgRating) ? "currentColor" : "none"} />
+                  ))}
+                </span>
+                <strong className="feedback-avg">{avgRating.toFixed(1)} / 5</strong>
+                <span className="table-sub">based on {feedback.length} {feedback.length === 1 ? "feedback" : "feedbacks"}</span>
+              </div>
+            )}
+            {feedback.length === 0 ? (
+              <p className="empty-note">No feedback yet. Residents' anonymous feedback will appear here.</p>
+            ) : (
+              <div className="feedback-list">
+                {feedback.map((f) => (
+                  <div key={f.id} className="feedback-card">
+                    <div className="feedback-card-top">
+                      <span className="feedback-stars-read">
+                        {[1, 2, 3, 4, 5].map((n) => (
+                          <Star key={n} size={14} fill={n <= f.rating ? "currentColor" : "none"} />
+                        ))}
+                      </span>
+                      <span className="table-sub">{fmtDate(f.dateSubmitted)}</span>
+                    </div>
+                    <p className="feedback-msg">{f.message}</p>
+                    <span className="anon-chip"><EyeOff size={12} /> Anonymous</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
         {dashTab === "officials" && (
           <>
             <h2 className="dash-title">Officials directory</h2>
@@ -1281,7 +1734,7 @@ function Dashboard({
                     {pendingOfficials.map((o) => (
                       <div key={o.username} className="pending-row">
                         <div className="pending-info">
-                          <div className="official-name">{o.fullName}</div>
+                          <div className="official-name"><OfficialAvatar official={o} sm /> {o.fullName}</div>
                           <div className="table-sub">{o.position} &middot; @{o.username}{o.email ? ` &middot; ${o.email}` : ""} &middot; applied {fmtDate(o.dateJoined)}</div>
                         </div>
                         <div className="pending-actions">
@@ -1300,7 +1753,7 @@ function Dashboard({
                 <tbody>
                   {officials.map((o) => (
                     <tr key={o.username}>
-                      <td>{o.fullName} {o.username === currentOfficial.username && <span className="you-chip">You</span>}</td>
+                      <td><span className="official-cell"><OfficialAvatar official={o} sm /> {o.fullName}</span> {o.username === currentOfficial.username && <span className="you-chip">You</span>}</td>
                       <td>{o.position}</td>
                       <td className="mono-tag">{o.username}</td>
                       <td className="table-sub">{o.email || "—"}</td>
@@ -1330,9 +1783,22 @@ function Dashboard({
               </Field>
               {pwError && <p className="form-error">{pwError}</p>}
               {pwMsg && <p className="form-success">{pwMsg}</p>}
-              <button className="btn-primary" disabled={pwBusy} onClick={handleChangePassword}>
-                {pwBusy ? <><Loader2 size={16} className="spin" /> Updatingâ€¦</> : <><KeyRound size={16} /> Update password</>}
+<button className="btn-primary" disabled={pwBusy} onClick={handleChangePassword}>
+                {pwBusy ? <><Loader2 size={16} className="spin" /> Updating&hellip;</> : <><KeyRound size={16} /> Update password</>}
               </button>
+            </div>
+            <div className="dash-panel" style={{ maxWidth: 460 }}>
+              <h3><Camera size={16} style={{ verticalAlign: -2, marginRight: 6 }} /> Profile picture</h3>
+              <div className="profile-pic-row">
+                <OfficialAvatar official={currentOfficial} />
+                <div className="profile-pic-actions">
+                  <button className="btn-ghost sm" onClick={() => photoInputRef.current && photoInputRef.current.click()}>Change photo</button>
+                  {currentOfficial.photo && <button className="btn-ghost sm" onClick={handleRemovePhoto}>Remove</button>}
+                </div>
+              </div>
+              <input ref={photoInputRef} type="file" accept="image/*" hidden onChange={handlePhotoChange} />
+              {photoError && <p className="form-error">{photoError}</p>}
+              {photoMsg && <p className="form-success">{photoMsg}</p>}
             </div>
             <div className="dash-panel" style={{ maxWidth: 460 }}>
               <h3><MailIcon size={16} style={{ verticalAlign: -2, marginRight: 6 }} /> Account</h3>
@@ -1343,6 +1809,55 @@ function Dashboard({
           </>
         )}
       </main>
+
+      {forcePassword && (
+        <ForcePasswordModal
+          changePassword={changePassword}
+          onDone={() => setForcePassword(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ForcePasswordModal({ changePassword, onDone }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const handleSave = async () => {
+    setError("");
+    if (!current || !next) { setError("Please fill in every field."); return; }
+    if (next !== confirm) { setError("New passwords do not match."); return; }
+    setBusy(true);
+    const res = await changePassword(current, next);
+    setBusy(false);
+    if (!res.ok) { setError(res.error); return; }
+    onDone();
+  };
+
+  return (
+    <div className="force-pw-overlay">
+      <div className="force-pw-card">
+        <h3 className="modal-title"><KeyRound size={18} style={{ verticalAlign: -2, marginRight: 6 }} /> Change your password</h3>
+        <p className="modal-sub">For security, you must set a new password before continuing.</p>
+        <Field label="Current password">
+          <input type="password" className="text-input" value={current} onChange={(e) => setCurrent(e.target.value)} />
+        </Field>
+        <Field label="New password" hint="At least 6 characters">
+          <input type="password" className="text-input" value={next} onChange={(e) => setNext(e.target.value)} />
+        </Field>
+        <Field label="Confirm new password">
+          <input type="password" className="text-input" value={confirm} onChange={(e) => setConfirm(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSave()} />
+        </Field>
+        {error && <p className="form-error">{error}</p>}
+        <button className="btn-primary lg" disabled={busy} onClick={handleSave} style={{ width: "100%" }}>
+          {busy ? <><Loader2 size={16} className="spin" /> Saving&hellip;</> : <><KeyRound size={16} /> Save new password</>}
+        </button>
+      </div>
     </div>
   );
 }
@@ -1368,7 +1883,7 @@ function FontsAndStyles() {
       .portal-root {
         --paper:#FAF6ED; --manila:#D9B872; --manila-dark:#B89550; --ink:#241F1B; --ink-light:#5C564D;
         --seal:#A83B2D; --seal-dark:#8A2F23; --teal:#163B44; --teal-light:#1F5563; --palm:#3E6B4F;
-        --box:rgba(250,246,237,0.78);
+        --box:rgba(250,246,237,0.96);
         font-family:'Public Sans', ui-sans-serif, system-ui, sans-serif;
         background:linear-gradient(rgba(22,59,68,0.45), rgba(20,26,22,0.55)), url(${JSON.stringify(cebuBgUrl)}) center/cover fixed no-repeat;
         color:var(--ink); min-height:100vh;
@@ -1381,6 +1896,8 @@ function FontsAndStyles() {
       @media (prefers-reduced-motion: reduce) { .portal-root * { animation:none !important; transition:none !important; } }
       .spin { animation:spin 0.9s linear infinite; }
       @keyframes spin { to { transform:rotate(360deg); } }
+      html, body { max-width:100%; overflow-x:hidden; }
+      .portal-root { overflow-x:hidden; }
 
       /* Header */
       .site-header { position:relative; position:sticky; top:0; z-index:30; background:var(--box); border-bottom:1px solid var(--manila); }
@@ -1397,6 +1914,9 @@ function FontsAndStyles() {
       .header-actions { margin-left:auto; display:flex; flex-direction:column; align-items:flex-end; gap:10px; }
       .header-actions .btn-primary.sm { color:#000; background:var(--box); border:1.5px solid #000; }
       .header-actions .btn-primary.sm:hover { background:rgba(250,246,237,.9); }
+      .header-feedback-btn { display:inline-flex; align-items:center; gap:6px; background:var(--box); border:1.5px solid var(--seal); color:var(--seal-dark); padding:7px 12px; border-radius:7px; font-size:12.5px; font-weight:600; }
+      .header-feedback-btn:hover { background:#F7E8E4; }
+      .header-feedback-row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:flex-end; }
       .nav-burger { background:none; border:none; color:#000; display:flex; align-items:center; justify-content:center; width:42px; height:42px; border-radius:12px; transition:background .15s; }
       .nav-burger:hover { background:rgba(0,0,0,.08); }
       .nav-mobile { position:fixed; top:0; left:0; bottom:0; display:flex; flex-direction:column; padding:16px 10px; gap:8px; border-right:1px solid rgba(255,255,255,.2); background:rgba(22,59,68,0.92); backdrop-filter:blur(8px); box-shadow:2px 0 18px rgba(0,0,0,.08); width:min(1.75in, 80vw); z-index:40; overflow-y:auto; }
@@ -1426,6 +1946,9 @@ function FontsAndStyles() {
       .hero-sub-fil { font-style:italic; color:#E8F2F5; margin-top:8px; font-size:15px; }
       .hero-body { margin-top:18px; font-size:16px; color:#E8F2F5; line-height:1.6; max-width:480px; }
       .hero-ctas { display:flex; gap:12px; margin-top:26px; flex-wrap:wrap; }
+      .hero-rating, .header-rating { display:flex; align-items:center; gap:7px; color:var(--ink); font-size:12px; font-weight:600; flex-wrap:wrap; }
+      .hero-rating-stars, .header-rating-stars { display:inline-flex; gap:1px; color:#D9A126; }
+      .hero-rating strong, .header-rating strong { font-size:12.5px; color:var(--teal); }
       .hero-seal { color:#fff; flex:0 0 auto; opacity:.9; }
       .btn-ghost.lg { color:#fff; border-color:rgba(255,255,255,.45); }
       .btn-ghost.lg:hover { border-color:rgba(255,255,255,.7); }
@@ -1471,7 +1994,20 @@ function FontsAndStyles() {
       .field-row { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
       @media (max-width:500px) { .field-row { grid-template-columns:1fr; } }
       .field-hint { font-weight:400; font-size:12px; color:var(--ink-light); }
-      .text-input { border:1.5px solid #E3D6AE; border-radius:7px; padding:10px 12px; font-size:14px; color:var(--ink); background:var(--box); }
+      .type-select { position:relative; }
+      .type-select-trigger { width:100%; display:flex; align-items:center; justify-content:space-between; gap:8px; background:#FDFBF4; border:1.5px solid #E3D6AE; border-radius:7px; padding:8px 10px; font-size:13px; color:var(--ink); text-align:left; cursor:pointer; }
+      .type-select-placeholder { color:var(--ink-light); }
+      .type-select-chev { transition:transform .15s; color:var(--ink-light); flex-shrink:0; }
+      .type-select-chev.open { transform:rotate(180deg); }
+      .type-select-menu { position:absolute; top:calc(100% + 4px); left:0; right:0; background:#FDFBF4; border:1px solid #E3D6AE; border-radius:9px; box-shadow:0 12px 30px rgba(0,0,0,.16); z-index:70; padding:4px; }
+      .type-option-wrap { display:flex; flex-direction:column; }
+      .type-option { width:100%; background:none; border:none; text-align:left; padding:6px 9px; border-radius:7px; font-size:13px; color:var(--ink); cursor:pointer; }
+      .type-option:hover { background:#EAF1F1; }
+      .type-option.active { background:var(--teal); color:#fff; font-weight:600; }
+      .type-comment-row { display:flex; align-items:center; gap:8px; padding:5px 8px; margin:2px 4px 4px; background:#F6F1E3; border:1px solid #E3D6AE; border-radius:8px; }
+      .type-comment-row span { font-size:12px; font-weight:600; color:var(--teal); white-space:nowrap; }
+      .type-comment-input { flex:1; min-width:0; font-size:13px; padding:5px 8px; background:#fff !important; }
+      .text-input { width:100%; max-width:100%; min-width:0; border:1.5px solid #E3D6AE; border-radius:7px; padding:10px 12px; font-size:14px; color:var(--ink); background:var(--box); }
       .text-input:focus { border-color:var(--teal); }
       .mono-input { font-family:'JetBrains Mono', monospace; }
       .form-error { color:var(--seal-dark); font-size:13px; margin:-6px 0 14px; }
@@ -1499,9 +2035,16 @@ function FontsAndStyles() {
       .officials-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:16px; }
       .official-card { background:var(--box); border:1px solid #EADFC0; border-radius:12px; padding:16px; display:flex; align-items:center; gap:12px; backdrop-filter:blur(8px); }
       .official-avatar { width:42px; height:42px; border-radius:50%; background:var(--teal); color:#fff; display:flex; align-items:center; justify-content:center; font-weight:600; font-size:13px; flex-shrink:0; }
+      .official-avatar.photo { object-fit:cover; }
       .official-avatar.sm { width:32px; height:32px; font-size:11px; }
-      .official-name { font-weight:600; font-size:14px; }
+      .official-name { font-weight:600; font-size:14px; overflow-wrap:anywhere; }
+      .official-name .official-avatar { display:inline-flex; vertical-align:middle; margin-right:6px; }
+      .official-cell { display:inline-flex; align-items:center; gap:8px; }
+      .profile-pic-row { display:flex; align-items:center; gap:16px; margin-bottom:4px; }
+      .profile-pic-actions { display:flex; flex-direction:column; gap:8px; align-items:flex-start; }
       .official-position { font-size:12.5px; color:var(--ink-light); }
+      .official-card > div:last-child { min-width:0; }
+      .official-card .table-sub { word-break:break-all; overflow-wrap:anywhere; }
 
       /* Status badges */
       .status-badge { display:inline-flex; align-items:center; gap:5px; font-size:12px; font-weight:600; padding:4px 10px; border-radius:20px; white-space:nowrap; }
@@ -1567,7 +2110,12 @@ function FontsAndStyles() {
       .auth-tab { flex:1; display:flex; align-items:center; justify-content:center; gap:6px; background:none; border:none; padding:9px; border-radius:7px; font-size:13.5px; font-weight:600; color:var(--ink-light); }
       .auth-tab.active { background:var(--box); color:var(--teal); box-shadow:0 1px 3px rgba(0,0,0,.08); }
       .auth-form { display:flex; flex-direction:column; }
+      .auth-link { align-self:center; background:none; border:none; color:var(--teal); font-size:12.5px; font-weight:600; margin-top:14px; padding:4px; }
+      .auth-link:hover { text-decoration:underline; }
       .auth-demo-note { font-size:11.5px; color:var(--manila-dark); margin-top:12px; line-height:1.5; }
+
+      .force-pw-overlay { position:fixed; inset:0; background:rgba(36,31,27,.65); display:flex; align-items:center; justify-content:center; padding:20px; z-index:80; }
+      .force-pw-card { background:var(--box); border-radius:16px; padding:28px; width:100%; max-width:420px; box-shadow:0 24px 60px rgba(0,0,0,.2); }
 
       /* Dashboard */
       .dash-root { display:flex; min-height:100vh; }
@@ -1625,7 +2173,154 @@ function FontsAndStyles() {
       .pending-list { display:flex; flex-direction:column; gap:10px; }
       .pending-row { display:flex; justify-content:space-between; align-items:center; gap:14px; padding:12px 14px; border:1px solid #E3D6AE; border-radius:10px; background:var(--box); backdrop-filter:blur(8px); }
       .pending-info { min-width:0; }
+      .pending-info .table-sub { word-break:break-all; overflow-wrap:anywhere; }
       .pending-actions { display:flex; align-items:center; gap:8px; flex-shrink:0; }
+      .dash-nav-badge { margin-left:auto; background:var(--seal); color:#fff; font-size:10.5px; font-weight:700; min-width:18px; height:18px; padding:0 5px; border-radius:9px; display:inline-flex; align-items:center; justify-content:center; }
+      .dash-nav-item.active .dash-nav-badge { background:var(--seal); color:#fff; }
+
+      .feedback-list { display:flex; flex-direction:column; gap:14px; }
+      .feedback-summary { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+      .feedback-avg { font-size:20px; font-family:'JetBrains Mono', monospace; color:var(--teal); }
+      .feedback-summary .table-sub { margin:0; }
+      .feedback-card { background:var(--box); border:1px solid #EADFC0; border-radius:14px; padding:18px 20px; backdrop-filter:blur(8px); }
+      .feedback-card-top { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+      .feedback-stars-read { display:inline-flex; gap:2px; color:#D9A126; }
+      .feedback-msg { font-size:14px; line-height:1.55; margin:10px 0 12px; color:var(--ink); }
+      .anon-chip { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; font-weight:600; color:var(--ink-light); background:#F1E9D2; padding:4px 10px; border-radius:20px; }
+
+      .feedback-stars { display:flex; gap:6px; justify-content:center; margin-bottom:20px; }
+      .feedback-star { background:none; border:none; padding:2px; color:#D9B872; }
+      .feedback-star.active { color:#D9A126; }
+      .feedback-thanks { display:flex; justify-content:center; margin:8px 0 20px; }
+
+      /* ---- Mobile / small-screen responsiveness (desktop unchanged) ---- */
+      @media (max-width:900px) {
+        .section { padding:44px 16px; }
+        .hero { padding:32px 16px 40px; gap:24px; }
+        .dash-main { padding:18px 14px; }
+        .footer-inner { padding:32px 18px; }
+      }
+      @media (max-width:820px) {
+        .modal-overlay { padding:0; align-items:stretch; }
+        .modal-card { width:100%; max-width:100%; height:100vh; height:100dvh; max-height:100vh; max-height:100dvh; border-radius:0; padding:24px 18px; }
+        .request-form-card { padding:20px 16px; }
+        .ticket-list { max-height:none; }
+        input, select, textarea { font-size:15px; }
+      }
+      @media (max-width:720px) {
+        .dash-root { flex-direction:column; }
+        .dash-sidebar { width:100%; height:auto; position:sticky; top:0; z-index:30; padding:10px 12px 8px; flex-direction:column; }
+        .dash-sidebar .brand { margin-bottom:8px; }
+        .dash-nav { flex-direction:row; flex-wrap:nowrap; gap:8px; flex:0 0 auto; overflow-x:auto; padding-bottom:2px; -webkit-overflow-scrolling:touch; }
+        .dash-nav-item { flex:0 0 auto; padding:8px 12px; justify-content:center; white-space:nowrap; }
+        .dash-sidebar-footer { display:none; }
+        .dash-topbar { display:flex; }
+        .activity-row { grid-template-columns:1fr; gap:5px; }
+        .activity-row .status-badge { justify-self:flex-start; }
+        .chat-widget { left:16px; right:16px; }
+        .chat-panel { width:100%; max-width:none; }
+        .chat-messages { max-height:34vh; }
+      }
+      @media (max-width:640px) {
+        .services-grid, .corkboard, .officials-grid { grid-template-columns:1fr; }
+      }
+      @media (max-width:560px) {
+        .hero h1 { font-size:clamp(23px,6.5vw,30px); }
+        .hero-sub-fil { font-size:13px; }
+        .hero-body { font-size:13.5px; line-height:1.5; }
+        .eyebrow { font-size:10.5px; letter-spacing:.07em; }
+        .hero-seal .seal { width:110px !important; height:110px !important; }
+        .section-heading h2 { font-size:20px; }
+        .section-heading .eyebrow { font-size:10.5px; }
+        .dash-title { font-size:19px; }
+        .stat-grid { grid-template-columns:repeat(2,1fr); }
+        .footer-inner { flex-direction:column; gap:18px; }
+        .ticket-ref { font-size:18px; }
+        .service-card h3 { font-size:13.5px; }
+        .service-card p { font-size:12px; }
+        .service-link { font-size:12px; }
+        .pin-note h4 { font-size:13.5px; }
+        .pin-note p { font-size:12px; }
+        .field-label { font-size:12px; }
+        .field-hint { font-size:11px; }
+        .btn-primary, .btn-ghost { font-size:12.5px; }
+        .modal-title { font-size:16px; }
+        .modal-sub { font-size:12px; }
+        .status-badge { font-size:11px; }
+        .chat-message { font-size:12px; }
+        .chat-header { font-size:12.5px; }
+        .official-name { font-size:12.5px; }
+        .official-position { font-size:11.5px; }
+        .ticket-body > div { font-size:12px; }
+        .ticket-hint { font-size:11px; }
+        .dash-nav-item { font-size:12px; }
+        .stat-label { font-size:11.5px; }
+        .dash-panel h3 { font-size:13.5px; }
+        .dash-table { font-size:12px; }
+        .activity-row { font-size:12px; }
+        .filter-chip { font-size:11.5px; }
+        .btn-primary.lg { width:100%; justify-content:center; }
+        .track-row { flex-direction:column; align-items:stretch; }
+        .track-row .btn-primary { justify-content:center; }
+      }
+      @media (max-width:520px) {
+        .header-inner { gap:8px; padding:10px 8px; }
+        .left-header { gap:6px; }
+        .brand .seal { width:34px !important; height:34px !important; }
+        .brand-name { font-size:14px; }
+        .brand-city { font-size:10px; }
+        .nav-burger { width:38px; height:38px; }
+        .header-actions .btn-primary.sm { padding:6px 10px; font-size:12px; gap:5px; }
+        .hero { padding:24px 12px 34px; gap:16px; }
+        .hero-seal .seal { width:92px !important; height:92px !important; }
+        .hero-ctas { width:100%; }
+        .hero-ctas .btn-primary.lg, .hero-ctas .btn-ghost.lg { width:100%; justify-content:center; }
+        .section { padding:38px 12px; }
+        .section-heading { margin-bottom:24px; }
+        .services-grid, .corkboard, .officials-grid { gap:14px; }
+        .service-card { padding:18px; }
+        .request-form-card { padding:18px 14px; }
+        .chat-widget { left:12px; right:12px; bottom:12px; }
+        .chat-toggle { width:48px; height:48px; }
+        .chat-panel { max-height:60vh; }
+        .dash-main { padding:14px 10px; }
+        .dash-topbar .btn-primary.sm { width:100%; justify-content:center; }
+        .stat-card { padding:14px 12px; }
+        .stat-value { font-size:24px; }
+        .dash-panel { padding:16px 14px; }
+        .pending-row { flex-direction:column; align-items:flex-start; }
+        .pending-actions { width:100%; }
+        .pending-actions .btn-primary.sm { flex:1; justify-content:center; }
+        .ann-row { flex-wrap:wrap; }
+        .filter-chip { font-size:11.5px; padding:6px 10px; }
+        .modal-card { padding:22px 16px; }
+        .auth-tabs .auth-tab { font-size:12.5px; }
+        .official-card { align-items:flex-start; }
+      }
+      @media (max-width:400px) {
+        .header-inner { padding:8px 6px; }
+        .left-header { gap:4px; }
+        .brand { gap:5px; }
+        .brand .seal { width:30px !important; height:30px !important; }
+        .brand-text { min-width:0; }
+        .brand-name { font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:128px; }
+        .brand-city { font-size:9px; }
+        .nav-burger { width:34px; height:34px; }
+        .header-actions .btn-primary.sm { padding:5px 8px; font-size:11px; }
+        .hero h1 { font-size:23px; }
+        .section-heading h2 { font-size:20px; }
+      }
+      @media (min-width:561px) {
+        #officials .section-heading { margin-bottom:22px; }
+        #officials .section-heading h2 { font-size:24px; }
+        #officials .section-heading .eyebrow { font-size:11px; }
+        #officials .officials-grid { grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:12px; }
+        #officials .official-card { padding:12px 14px; gap:10px; }
+        #officials .official-avatar { width:34px; height:34px; font-size:11px; }
+        #officials .official-name { font-size:13px; }
+        #officials .official-position { font-size:12px; }
+        #officials .table-sub { font-size:11px; }
+      }
     `}</style>
   );
 }

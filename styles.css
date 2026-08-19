@@ -19,6 +19,8 @@ body {
   min-height: 100vh;
   background: linear-gradient(180deg, #efe6ca 0%, #dcd2b2 100%);
   color: var(--brown);
+  max-width: 100%;
+  overflow-x: hidden;
 }
 
 button,

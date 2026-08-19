@@ -5,9 +5,17 @@ import "./styles.css";
 
 if (!window.storage) {
   window.storage = {
+    _authHeaders(extra = {}) {
+      const headers = { ...extra };
+      try {
+        const token = localStorage.getItem("bportal_token");
+        if (token) headers["Authorization"] = `Bearer ${token}`;
+      } catch {}
+      return headers;
+    },
     async list(prefix) {
       try {
-        const res = await fetch(`/storage/list?prefix=${encodeURIComponent(prefix)}`);
+        const res = await fetch(`/storage/list?prefix=${encodeURIComponent(prefix)}`, { headers: this._authHeaders() });
         if (res.ok) return await res.json();
       } catch {
         // fallback to localStorage if backend is unavailable
@@ -17,7 +25,7 @@ if (!window.storage) {
     },
     async get(key) {
       try {
-        const res = await fetch(`/storage/get?key=${encodeURIComponent(key)}`);
+        const res = await fetch(`/storage/get?key=${encodeURIComponent(key)}`, { headers: this._authHeaders() });
         if (res.ok) return await res.json();
         if (res.status === 404) return null;
       } catch {
@@ -30,7 +38,7 @@ if (!window.storage) {
       try {
         const res = await fetch('/storage/set', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: this._authHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({ key, value }),
         });
         if (res.ok) return true;
@@ -44,6 +52,7 @@ if (!window.storage) {
       try {
         const res = await fetch(`/storage/delete?key=${encodeURIComponent(key)}`, {
           method: 'DELETE',
+          headers: this._authHeaders(),
         });
         if (res.ok) return true;
       } catch {
