@@ -1245,7 +1245,7 @@ function AuthModal({ authTab, setAuthTab, authError, setAuthError, regMessage, s
     setResetBusy(false);
     if (!res.ok) { setResetError(res.error); return; }
     setResetStep(2);
-    setResetMsg(`Reset code ${res.code} — in production this would be emailed to you. Enter it below within 30 minutes.`);
+    setResetMsg("A 6-digit reset code has been emailed to you. Enter it below within 30 minutes.");
   };
 
   const handleDoReset = async () => {

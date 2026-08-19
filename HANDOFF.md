@@ -12,15 +12,14 @@ Last updated: 2026-08-19
 - Login works. Verified account:
   - `sydrick16` / `Sydrick16` (SK Treasurer, approved)
   - `admin` — password is NOT `admin123`; stored hash doesn't match. Reset via forgot-password (code is returned in the response) or ask to reset.
-- `dist/` build is current (built 08:10).
+- `dist/` build is current (rebuilt 08:xx).
+- `index.html` now loads `/main.jsx` (auth header wrapper). Deleted stale `src/main.jsx` + `src/App.jsx`.
 
 ## Pending fixes (open list)
 
-1. **CRITICAL — app loads stale `window.storage` (no auth headers).**
-   - `index.html` -> `/src/main.jsx` (old wrapper, no `Authorization` header).
-   - The fixed wrapper is at root `main.jsx` (currently dead code).
-   - Fix: point `index.html` to `/main.jsx` and delete `src/main.jsx`, `src/App.jsx`, or copy the auth wrapper into `src/main.jsx`.
-   - Without this, dashboard storage calls 403 and silently fall back to `localStorage`.
+1. **[DONE] App loaded stale `window.storage` (no auth headers)** — this was why the account couldn't open.
+   - Fixed: `index.html` -> `/main.jsx` (auth header wrapper). Deleted stale `src/main.jsx`, `src/App.jsx`. Rebuilt `dist/`.
+   - Verified: login + authed `storage/list` return 200 through the vite proxy.
 
 2. **Test is stale.** `tests/test_model_download.py` calls `backend.ensure_local_model()` which no longer exists. Fix or delete the test.
 
@@ -29,7 +28,8 @@ Last updated: 2026-08-19
 
 4. **No server-side admin enforcement.** Any logged-in official can approve/reject others, edit any request status, post/delete announcements (`backend.py` `/storage/set`). Gate admin actions on `isAdmin`.
 
-5. **Reset code returned in API response** (`/api/reset-request`). OK for demo; email/SMS the code for production.
+5. **[DONE] Reset code returned in API response** (`/api/reset-request`).
+   - Now emailed to the account's Gmail via SMTP (`backend.py` `_send_email`, env: `SMTP_*`). The code is never returned in the API response; if email delivery fails, the request errors out and the reset is cleared. Frontend message updated (`java.jsx`).
 
 6. **`fmtDate` bug** — `java.jsx:59` returns a stray `”` when `ts` is falsy.
 

@@ -8,8 +8,10 @@ import time
 import base64
 import hashlib
 import secrets
+import smtplib
 import sqlite3
 from collections import defaultdict
+from email.message import EmailMessage
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,6 +22,11 @@ HF_MODEL = os.environ.get('HF_MODEL', 'meta-llama/Llama-2-7b-chat-hf')
 HF_API_KEY = os.environ.get('HF_API_KEY', '')
 DEEPSEEK_MODEL = os.environ.get('DEEPSEEK_MODEL', 'deepseek-chat')
 DEEPSEEK_API_KEY = os.environ.get('DEEPSEEK_API_KEY', '')
+SMTP_HOST = os.environ.get('SMTP_HOST', '')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '587') or 587)
+SMTP_USER = os.environ.get('SMTP_USER', '')
+SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
+SMTP_FROM = os.environ.get('SMTP_FROM', '')
 LOCAL_LLAMA_MODEL_PATH = os.environ.get(
     'LOCAL_LLAMA_MODEL_PATH',
     os.path.join(os.path.dirname(__file__), 'models', 'Llama-2-7b-chat.gguf')
@@ -96,6 +103,26 @@ def _verify_password(stored, password):
         except Exception:
             return False
     return stored.get('password') == password
+
+
+def _send_email(to_addr, subject, body):
+    """Send an email over SMTP. Returns True on success, False if unavailable/failed."""
+    if not (SMTP_HOST and SMTP_FROM and to_addr):
+        return False
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = SMTP_FROM
+    msg['To'] = to_addr
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls()
+            if SMTP_USER and SMTP_PASSWORD:
+                server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        return True
+    except Exception:
+        return False
 
 
 def _ensure_demo_admin():
@@ -571,7 +598,18 @@ class StorageHandler(BaseHTTPRequestHandler):
             'code': code,
             'expires': time.time() + 1800,
         })
-        self._send_json(200, {'ok': True, 'code': code})
+        sent = _send_email(
+            official.get('email', ''),
+            'Your password reset code',
+            f'Your password reset code is {code}. It expires in 30 minutes. '
+            'If you did not request this, you can ignore this email.',
+        )
+        if sent:
+            self._send_json(200, {'ok': True})
+            return
+        with conn:
+            conn.execute('DELETE FROM kv_store WHERE key = ?', (f'resets:{official["username"]}',))
+        self._send_json(500, {'error': 'Could not send the reset code by email. Please try again or contact your administrator.'})
 
     def _handle_reset_complete(self):
         data = self._read_json()
