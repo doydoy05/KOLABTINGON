@@ -1,33 +1,53 @@
-# BPORTAL
-Portal For the baranagy kolabtingon
+# BPORTAL — Barangay Kolabtingon Portal
 
-## Local AI chat backend setup
+Portal for Barangay Kolabtingon, Dumanjug, Cebu. Residents file and track
+barangay requests; officials manage them from an admin dashboard. Includes an
+AI chat assistant backed by a local Llama model or a Hugging Face API key.
 
-This project now uses a Python backend at `backend.py` with optional legacy Node support in `server.js`.
+## Develop locally
 
-### Run the backend
+1. Install dependencies: `npm install`
+2. (Optional, for local chat) `python -m pip install llama-cpp-python` and place a
+   GGUF model at `models/` — set `LOCAL_LLAMA_MODEL_PATH` (see `.env.example`).
+3. Run the backend: `npm run pyserver` (port 8000, with `/healthz` check)
+4. Run the frontend in another terminal: `npm run dev` (port 3000, proxies
+   `/api` + `/storage` to the backend)
+5. Or both at once: `npm start`
 
-1. Install dependencies if needed: `npm install`
-2. Install the Python local runtime dependency: `python -m pip install llama-cpp-python`
-3. Download a local Llama 2 GGUF model, for example `meta-llama/Llama-2-7b-chat-hf`.
-4. Set `LOCAL_LLAMA_MODEL_PATH` to the downloaded GGUF model file path, or place it at `models/Llama-2-7b-chat.gguf`.
-5. Run the Python backend: `npm run pyserver`
-6. Start the frontend in another terminal: `npm run dev`
+Demo admin: `admin` / `admin123` (seeded into a fresh `storage.db`).
 
-### Local Llama runtime
+## Test & build
 
-By default the backend will use a local Llama 2 model if the model file exists at `LOCAL_LLAMA_MODEL_PATH`.
+- Tests: `python3 -m pytest tests/ -q` (unit + end-to-end smoke tests)
+- Build: `npm run build` (outputs `dist/`)
+- DB backup: `./scripts/backup_db.sh` (keeps the 14 newest in `backups/`)
 
-- No API key is required for local model generation.
-- If the local model is missing, the backend can still fall back to Hugging Face inference when `HF_API_KEY` is set.
-- Use `HF_MODEL` to override the remote model name if you want to keep remote fallback enabled.
+## Going live (Netlify + backend host)
 
-### Notes
+Netlify serves **static files only** — the Python backend must be hosted
+separately (Render / Railway / Fly / VPS), then wired together:
 
-- Vite proxy forwards `/api` and `/storage` requests to `http://localhost:8000`.
-- Local models must be downloaded separately and can be large (several GB).
+1. **Backend host**: deploy `backend.py` with Python 3.12 + `pip install python-dotenv`
+   (+ `llama-cpp-python` only if you run the local model there). Set env vars:
+   `PORT` (or the host's assigned port — it is respected), `STORAGE_DB_PATH`
+   (persistent volume path), `FRONTEND_ORIGIN=https://your-site.netlify.app`,
+   `TRUST_PROXY=1`, `ADMIN_USERNAME` / `ADMIN_PASSWORD` / `ADMIN_EMAIL`,
+   `SMTP_*`, and your model key (`DEEPSEEK_API_KEY` or `HF_API_KEY`).
+   Optionally set `REQUIRE_CHAT_AUTH=1` so only logged-in users can use chat.
+2. **Netlify**: build command `npm run build`, publish directory `dist`, and set
+   build env `VITE_API_URL=https://your-backend-host.example.com`.
+   `netlify.toml` (SPA fallback) and `public/_headers` (security headers) are
+   already in the repo.
+3. **After launch**: every login resets to a hashed session token (old sessions
+   from before this change are invalid — users simply log in again), and
+   production builds never fall back to browser `localStorage` (failed writes
+   surface as errors instead).
 
-### Notes
+## Security notes
 
-- Vite proxy forwards `/api` and `/storage` requests to `http://localhost:8000`.
-- If you want local no-key operation later, you can replace the backend call with a local Llama runtime.
+- Never commit `.env`, `storage.db`, `backups/`, or `models/` — all are git-ignored.
+- If secrets or the database were ever committed, **rotate the keys and purge
+  git history** (untracking alone is not enough).
+- Sessions are SHA-256 hashed server-side with sliding 12h expiry; admin-only
+  actions (approvals, announcements, status changes, deletes) are enforced in
+  `backend.py`, not just the UI.

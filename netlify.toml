@@ -1,0 +1,13 @@
+# Netlify: static frontend. Build with the backend host baked in, e.g.
+#   VITE_API_URL=https://your-backend-host.example.com
+# The Python backend (backend.py) must be hosted separately (Render/Railway/Fly/VPS).
+
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# SPA fallback — the app is a single page.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

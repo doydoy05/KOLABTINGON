@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, Suspense } from "react";
 import {
   Menu, X, FileCheck2, Receipt, HeartHandshake, Home, Briefcase, BadgeCheck,
   AlertCircle, MessageSquare, Search, ShieldCheck, LogIn, UserPlus, LogOut,
@@ -7,12 +7,30 @@ import {
   MapPin, Phone, Mail, Loader2, Pin as PinIcon, Settings, KeyRound, Mail as MailIcon,
   MessageSquareHeart, Send, EyeOff, Camera,
 } from "lucide-react";
-import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-} from "recharts";
-import logoUrl from "./Images/KOLABTINGON LOGO.jpg";
-import chatIconUrl from "./Images/CHATBOT.jpg";
-import cebuBgUrl from "./Images/CEBU.jpg.jpg";
+// Charts load lazily so the public landing page never downloads the chart library.
+const RequestsChart = React.lazy(() =>
+  import("recharts").then((m) => ({
+    default: function RequestsChart({ data }) {
+      const { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } = m;
+      return (
+        <div style={{ width: "100%", height: 260 }}>
+          <ResponsiveContainer>
+            <BarChart data={data} margin={{ top: 8, right: 8, left: -20, bottom: 8 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#E5DCC4" />
+              <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#55504A" }} interval={0} angle={-20} textAnchor="end" height={95} />
+              <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#55504A" }} />
+              <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #D9B872" }} />
+              <Bar dataKey="count" fill="#163B44" radius={[4, 4, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      );
+    },
+  }))
+);
+import logoUrl from "./Images/kolabtingon-logo.jpg";
+import chatIconUrl from "./Images/chatbot.jpg";
+import cebuBgUrl from "./Images/cebu.jpg";
 
 /* ---------------------------------------------------------------------- */
 /*  Content constants — edit these to rename/rebrand for a real barangay  */
@@ -56,7 +74,7 @@ function genId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 function fmtDate(ts) {
-  if (!ts) return "”";
+  if (!ts) return "—";
   return new Date(ts).toLocaleString("en-PH", { dateStyle: "medium", timeStyle: "short" });
 }
 
@@ -103,8 +121,12 @@ function apiHeaders(extra = {}) {
   return headers;
 }
 
+// Backend host configured at build time (see main.jsx). Empty = same origin (dev proxy).
+const API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/$/, "");
+const api = (path) => `${API_BASE}${path}`;
+
 async function apiPost(path, body) {
-  const res = await fetch(path, {
+  const res = await fetch(api(path), {
     method: "POST",
     headers: apiHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
@@ -114,7 +136,7 @@ async function apiPost(path, body) {
 }
 
 async function apiGet(path) {
-  const res = await fetch(path, { headers: apiHeaders() });
+  const res = await fetch(api(path), { headers: apiHeaders() });
   const payload = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, ...payload };
 }
@@ -177,10 +199,15 @@ function Field({ label, children, hint }) {
   );
 }
 
-function Modal({ onClose, children, width = 480, dark = false }) {
+function Modal({ onClose, children, width = 480, dark = false, label = "Dialog" }) {
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
   return (
     <div className="modal-overlay" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className={`modal-card${dark ? " modal-card-dark" : ""}`} style={{ maxWidth: width }}>
+      <div className={`modal-card${dark ? " modal-card-dark" : ""}`} style={{ maxWidth: width }} role="dialog" aria-modal="true" aria-label={label}>
         <button className="modal-close" onClick={onClose} aria-label="Close">
           <X size={18} />
         </button>
@@ -215,7 +242,7 @@ export default function BarangayPortal() {
   const [trackInput, setTrackInput] = useState("");
   const [trackResult, setTrackResult] = useState(undefined); // undefined = not searched, null = not found
 
-  const [reqForm, setReqForm] = useState({ type: "", fullName: "", contact: "", address: "", details: "", comment: "" });
+  const [reqForm, setReqForm] = useState({ type: "", fullName: "", contact: "", address: "", details: "", comment: "", consent: false });
   const [reqBusy, setReqBusy] = useState(false);
   const [reqError, setReqError] = useState("");
   const [tickets, setTickets] = useState([]);
@@ -351,6 +378,10 @@ export default function BarangayPortal() {
       setReqError("Please fill in your name, contact number, address, and the type of request.");
       return false;
     }
+    if (!reqForm.consent) {
+      setReqError("Please tick the privacy consent box so the barangay office may process your details.");
+      return false;
+    }
     setReqBusy(true);
     const id = genId("req");
     const payload = {
@@ -371,7 +402,7 @@ export default function BarangayPortal() {
       if (!result) throw new Error("Storage returned no result");
       setRequests((prev) => [payload, ...prev]);
       setTickets((prev) => [payload, ...prev]);
-      setReqForm({ type: "", fullName: "", contact: "", address: "", details: "", comment: "" });
+      setReqForm({ type: "", fullName: "", contact: "", address: "", details: "", comment: "", consent: false });
       setReqBusy(false);
       return true;
     } catch {
@@ -423,6 +454,10 @@ export default function BarangayPortal() {
     }
     if (form.password !== form.confirm) {
       setAuthError("Passwords do not match.");
+      return;
+    }
+    if (form.password.length < 6) {
+      setAuthError("Password must be at least 6 characters.");
       return;
     }
     const email = form.email.trim().toLowerCase();
@@ -504,7 +539,7 @@ export default function BarangayPortal() {
   function handleLogout() {
     const token = localStorage.getItem("bportal_token");
     if (token) {
-      fetch("/api/logout", { method: "POST", headers: apiHeaders() }).catch(() => {});
+      fetch(api("/api/logout"), { method: "POST", headers: apiHeaders() }).catch(() => {});
     }
     localStorage.removeItem("bportal_token");
     setCurrentOfficial(null);
@@ -550,7 +585,7 @@ export default function BarangayPortal() {
     try {
       const res = await apiPost("/api/reset-request", { identifier: identifier.trim().toLowerCase() });
       if (!res.ok) return { ok: false, error: res.error || "Could not start a password reset. Please try again." };
-      return { ok: true, code: res.code };
+      return { ok: true };
     } catch {
       return { ok: false, error: "Could not start a password reset. Please try again." };
     }
@@ -793,7 +828,7 @@ function PublicSite({
     setChatLoading(true);
 
     try {
-      const response = await fetch("/api/chat", {
+      const response = await fetch(api("/api/chat"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ input: query, history: outgoingHistory }),
@@ -820,6 +855,8 @@ function PublicSite({
           <div className="left-header">
             <button
               className="nav-burger"
+              aria-label={mobileMenuOpen ? "Close menu" : "Open menu"}
+              aria-expanded={mobileMenuOpen}
               onClick={() => setMobileMenuOpen((v) => !v)}
             >
               {mobileMenuOpen ? <X size={22} /> : <Menu size={22} />}
@@ -1091,7 +1128,7 @@ function LoadingRow({ label }) {
 function Seal({ size }) {
   return (
     <div className="seal" style={{ width: size, height: size }}>
-      <img src={logoUrl} alt="Logo" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+      <img src={logoUrl} alt="Barangay Kolabtingon logo" style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
     </div>
   );
 }
@@ -1183,6 +1220,11 @@ function RequestFields({ reqForm, setReqForm, reqError, reqBusy, onSubmit }) {
         </Field>
       )}
       {reqError && <p className="form-error">{reqError}</p>}
+      <label className="consent-row">
+        <input type="checkbox" checked={!!reqForm.consent}
+          onChange={(e) => setReqForm((f) => ({ ...f, consent: e.target.checked }))} />
+        <span>I agree that the barangay office may collect and use my name, contact, and address to process this request.</span>
+      </label>
       <button className="btn-primary lg" disabled={reqBusy} onClick={onSubmit}>
         {reqBusy ? <><Loader2 size={16} className="spin" /> Submitting&hellip;</> : <>Submit request <ChevronRight size={16} /></>}
       </button>
@@ -1570,17 +1612,9 @@ function Dashboard({
               {chartData.length === 0 ? (
                 <p className="empty-note">No requests yet this chart will fill in as residents submit requests.</p>
               ) : (
-                <div style={{ width: "100%", height: 260 }}>
-                  <ResponsiveContainer>
-                    <BarChart data={chartData} margin={{ top: 8, right: 8, left: -20, bottom: 8 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#E5DCC4" />
-                      <XAxis dataKey="name" tick={{ fontSize: 11, fill: "#55504A" }} interval={0} angle={-20} textAnchor="end" height={95} />
-                      <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#55504A" }} />
-                      <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: "1px solid #D9B872" }} />
-                      <Bar dataKey="count" fill="#163B44" radius={[4, 4, 0, 0]} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
+                <Suspense fallback={<p className="empty-note">Loading chart…</p>}>
+                  <RequestsChart data={chartData} />
+                </Suspense>
               )}
             </div>
             <div className="dash-panel">

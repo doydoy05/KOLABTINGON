@@ -1,7 +1,8 @@
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+import datetime
 import json
 import os
 import time
@@ -10,6 +11,7 @@ import hashlib
 import secrets
 import smtplib
 import sqlite3
+import sys
 from collections import defaultdict
 from email.message import EmailMessage
 from dotenv import load_dotenv
@@ -17,7 +19,16 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-DB_PATH = os.path.join(os.path.dirname(__file__), 'storage.db')
+DB_PATH = os.environ.get('STORAGE_DB_PATH', os.path.join(os.path.dirname(__file__), 'storage.db'))
+PORT = int(os.environ.get('PORT', '8000') or 8000)
+# Production frontend origin for CORS. Defaults to '*' for local dev only.
+FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
+# Set TRUST_PROXY=1 when running behind a reverse proxy / host load balancer so
+# rate limiting sees the real client IP via X-Forwarded-For.
+TRUST_PROXY = os.environ.get('TRUST_PROXY', '').lower() in ('1', 'true', 'yes')
+# Set REQUIRE_CHAT_AUTH=1 to require a logged-in session for /api/chat
+# (recommended in production so anonymous visitors can't burn model quota).
+REQUIRE_CHAT_AUTH = os.environ.get('REQUIRE_CHAT_AUTH', '').lower() in ('1', 'true', 'yes')
 HF_MODEL = os.environ.get('HF_MODEL', 'meta-llama/Llama-2-7b-chat-hf')
 HF_API_KEY = os.environ.get('HF_API_KEY', '')
 DEEPSEEK_MODEL = os.environ.get('DEEPSEEK_MODEL', 'deepseek-chat')
@@ -126,11 +137,47 @@ def _send_email(to_addr, subject, body):
 
 
 def _ensure_demo_admin():
-    if conn.execute("SELECT 1 FROM kv_store WHERE key = 'officials:admin'").fetchone():
+    # Production bootstrap: ADMIN_USERNAME / ADMIN_PASSWORD / ADMIN_EMAIL seed
+    # (or repair) the initial admin account so the demo credentials are never
+    # needed in production and the admin always has a recovery email.
+    admin_user = os.environ.get('ADMIN_USERNAME', 'admin').strip().lower() or 'admin'
+    admin_pw = os.environ.get('ADMIN_PASSWORD', '')
+    admin_email = os.environ.get('ADMIN_EMAIL', '').strip().lower()
+    key = f'officials:{admin_user}'
+    row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (key,)).fetchone()
+    if row and (admin_pw or admin_email):
+        try:
+            rec = json.loads(row[0])
+        except Exception:
+            rec = {}
+        changed = False
+        if admin_pw:
+            salt, ph = _hash_password(admin_pw)
+            rec['salt'] = salt
+            rec['passwordHash'] = ph
+            rec.pop('password', None)
+            changed = True
+        if admin_email and rec.get('email') != admin_email:
+            rec['email'] = admin_email
+            changed = True
+        if rec.get('status') != 'approved' or not rec.get('isAdmin'):
+            rec['status'] = 'approved'
+            rec['isAdmin'] = True
+            changed = True
+        if changed:
+            rec['username'] = admin_user
+            with conn:
+                conn.execute(
+                    'INSERT INTO kv_store (key, value) VALUES (?, ?) '
+                    'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                    (key, json.dumps(rec)),
+                )
         return
-    salt, ph = _hash_password('admin123')
+    if row:
+        return
+    salt, ph = _hash_password(admin_pw or 'admin123')
     demo = {
-        'username': 'admin',
+        'username': admin_user,
         'fullName': 'Maria Santos',
         'position': 'Punong Barangay',
         'isAdmin': True,
@@ -138,10 +185,12 @@ def _ensure_demo_admin():
         'dateJoined': int(time.time() * 1000) - 86400000,
         'salt': salt,
         'passwordHash': ph,
-        'mustChangePassword': False,
+        'mustChangePassword': not bool(admin_pw),
     }
+    if admin_email:
+        demo['email'] = admin_email
     with conn:
-        conn.execute('INSERT INTO kv_store (key, value) VALUES (?, ?)', ('officials:admin', json.dumps(demo)))
+        conn.execute('INSERT INTO kv_store (key, value) VALUES (?, ?)', (key, json.dumps(demo)))
 
 
 _ensure_demo_admin()
@@ -152,10 +201,16 @@ class StorageHandler(BaseHTTPRequestHandler):
     OFFICIAL_EDITABLE = ('fullName', 'email', 'position', 'photo', 'status', 'isAdmin', 'mustChangePassword', 'dateJoined')
     PUBLIC_READ_PREFIXES = ('announcements:', 'officials:')
 
+    # Per-connection socket timeout so one slow client can't hold a thread forever.
+    timeout = 15
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write('%s - %s\n' % (datetime.datetime.now().isoformat(timespec='seconds'), fmt % args))
+
     def _set_headers(self, status=200, content_type='application/json'):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Origin', FRONTEND_ORIGIN)
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
@@ -173,6 +228,13 @@ class StorageHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(payload).encode('utf-8'))
 
     def _client_ip(self):
+        if TRUST_PROXY:
+            forwarded = self.headers.get('X-Forwarded-For', '')
+            if forwarded:
+                # Left-most entry is the original client; validate loosely.
+                candidate = forwarded.split(',')[0].strip()
+                if candidate and len(candidate) < 64:
+                    return candidate
         return self.client_address[0]
 
     def _rate_limited(self, scope, limit, window):
@@ -207,11 +269,18 @@ class StorageHandler(BaseHTTPRequestHandler):
                 return rec
         return None
 
+    def _session_key(self, token):
+        """Session lookup key. Only the SHA-256 of the token is stored, so a
+        database leak does not hand out live sessions."""
+        digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        return f'sessions:{digest}'
+
     def _get_session(self):
         token = self._get_token()
         if not token:
             return None
-        row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (f'sessions:{token}',)).fetchone()
+        key = self._session_key(token)
+        row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (key,)).fetchone()
         if not row:
             return None
         try:
@@ -220,11 +289,14 @@ class StorageHandler(BaseHTTPRequestHandler):
             return None
         if session.get('expires', 0) < time.time():
             with conn:
-                conn.execute('DELETE FROM kv_store WHERE key = ?', (f'sessions:{token}',))
+                conn.execute('DELETE FROM kv_store WHERE key = ?', (key,))
             return None
         official = self._get_official(session.get('username', ''))
         if not official or official.get('status') != 'approved':
             return None
+        # Sliding expiry: activity extends the session.
+        session['expires'] = time.time() + SESSION_TTL
+        self._store(key, session)
         return official
 
     def _strip_secrets(self, official):
@@ -285,16 +357,47 @@ class StorageHandler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def _ref_number_taken(self, ref_number, exclude_key=None):
+        """Check whether a request reference number already exists (case-insensitive)."""
+        if not isinstance(ref_number, str):
+            return False
+        want = ref_number.strip().upper()
+        cursor = conn.execute("SELECT key, value FROM kv_store WHERE key LIKE 'requests:%'")
+        for (key, value) in cursor.fetchall():
+            if exclude_key and key == exclude_key:
+                continue
+            try:
+                req = json.loads(value)
+            except Exception:
+                continue
+            if str(req.get('refNumber', '')).upper() == want:
+                return True
+        return False
+
     def _validate_registration(self, key, payload):
         if payload.get('status') != 'pending':
             return False
         for f in ('username', 'fullName', 'position', 'email'):
             if not isinstance(payload.get(f), str) or not payload.get(f).strip():
                 return False
+        # Basic email shape check (frontend additionally restricts to Gmail).
+        if '@' not in payload.get('email', '') or '.' not in payload.get('email', ''):
+            return False
         has_hash = isinstance(payload.get('passwordHash'), str) and isinstance(payload.get('salt'), str)
         has_legacy = isinstance(payload.get('password'), str)
         if not (has_hash or has_legacy):
             return False
+        if has_hash:
+            # Structural check: 16-byte salt and 32-byte hash, both base64.
+            # The server never sees the plaintext at registration, so this plus
+            # the client-side minimum-length check is the enforceable policy.
+            try:
+                salt_bytes = base64.b64decode(payload['salt'])
+                hash_bytes = base64.b64decode(payload['passwordHash'])
+            except Exception:
+                return False
+            if len(salt_bytes) != 16 or len(hash_bytes) != 32:
+                return False
         if conn.execute('SELECT 1 FROM kv_store WHERE key = ?', (key,)).fetchone():
             return False  # anonymous cannot overwrite an existing official
         email = payload.get('email', '').lower()
@@ -315,6 +418,10 @@ class StorageHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        if parsed.path == '/healthz':
+            self._send_json(200, {'ok': True})
+            return
 
         if parsed.path == '/api/session':
             official = self._get_session()
@@ -370,8 +477,20 @@ class StorageHandler(BaseHTTPRequestHandler):
                 self._send_json(403, {'error': 'Access denied.'})
                 return
             cursor = conn.execute('SELECT key FROM kv_store WHERE key LIKE ? ORDER BY key', (f'{prefix}%',))
-            keys = [row[0] for row in cursor.fetchall()]
-            self._send_json(200, {'keys': keys})
+            all_keys = [row[0] for row in cursor.fetchall()]
+            total = len(all_keys)
+            try:
+                limit = int(params.get('limit', ['0'])[0])
+            except (ValueError, TypeError):
+                limit = 0
+            try:
+                offset = int(params.get('offset', ['0'])[0])
+            except (ValueError, TypeError):
+                offset = 0
+            keys = all_keys[max(offset, 0):]
+            if limit > 0:
+                keys = keys[:min(limit, 1000)]
+            self._send_json(200, {'keys': keys, 'total': total})
             return
 
         if parsed.path == '/storage/get':
@@ -431,11 +550,14 @@ class StorageHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             key = params.get('key', [''])[0]
             official = self._get_session()
-            if key.startswith('sessions:'):
+            if key.startswith('sessions:') or key.startswith('resets:'):
                 self._send_json(403, {'error': 'Access denied.'})
                 return
-            if not official and not key.startswith('resets:'):
+            if not official:
                 self._send_json(403, {'error': 'Access denied.'})
+                return
+            if not bool(official.get('isAdmin')):
+                self._send_json(403, {'error': 'Admin access required.'})
                 return
             with conn:
                 conn.execute('DELETE FROM kv_store WHERE key = ?', (key,))
@@ -444,6 +566,69 @@ class StorageHandler(BaseHTTPRequestHandler):
         self._send_json(404, {'error': 'Not found'})
 
     # --------------------------- storage write ---------------------------- #
+    def _authorize_official_write(self, official, key, payload):
+        """Enforce admin-only writes. Returns True if allowed (else responds 403/400)."""
+        is_admin = bool(official.get('isAdmin'))
+        if not isinstance(payload, dict):
+            self._send_json(400, {'error': 'Invalid payload.'})
+            return False
+        if key.startswith('sessions:') or key.startswith('resets:'):
+            self._send_json(403, {'error': 'Access denied.'})
+            return False
+        if key.startswith('announcements:'):
+            if not is_admin:
+                self._send_json(403, {'error': 'Admin access required.'})
+                return False
+            return True
+        if key.startswith('officials:'):
+            target = key.split(':', 1)[1].lower() if ':' in key else ''
+            self_name = str(official.get('username', '')).lower()
+            exists = conn.execute('SELECT 1 FROM kv_store WHERE key = ?', (key,)).fetchone()
+            if not exists and not is_admin:
+                self._send_json(403, {'error': 'Admin access required.'})
+                return False
+            if target != self_name and not is_admin:
+                self._send_json(403, {'error': 'Admin access required.'})
+                return False
+            if not is_admin:
+                # Non-admins may only touch their own profile photo/fullName/email.
+                for field in ('status', 'isAdmin', 'mustChangePassword', 'dateJoined', 'position', 'username'):
+                    if field in payload:
+                        existing = self._get_official(target)
+                        if not existing or payload.get(field) != existing.get(field):
+                            self._send_json(403, {'error': 'Admin access required.'})
+                            return False
+            return True
+        if key.startswith('requests:'):
+            exists = conn.execute('SELECT 1 FROM kv_store WHERE key = ?', (key,)).fetchone()
+            if exists:
+                # Only admins may change request status/details after filing.
+                if not is_admin:
+                    self._send_json(403, {'error': 'Admin access required.'})
+                    return False
+                return True
+            if not self._validate_request(payload):
+                self._send_json(400, {'error': 'Invalid request data.'})
+                return False
+            if self._ref_number_taken(payload.get('refNumber', '')):
+                self._send_json(409, {'error': 'That reference number is already in use. Please file again.'})
+                return False
+            return True
+        if key.startswith('feedback:'):
+            exists = conn.execute('SELECT 1 FROM kv_store WHERE key = ?', (key,)).fetchone()
+            if exists and not is_admin:
+                self._send_json(403, {'error': 'Admin access required.'})
+                return False
+            if not exists and not self._validate_feedback(payload):
+                self._send_json(400, {'error': 'Invalid feedback data.'})
+                return False
+            return True
+        # Unknown prefixes: only admins may write arbitrary keys.
+        if not is_admin:
+            self._send_json(403, {'error': 'Admin access required.'})
+            return False
+        return True
+
     def _handle_storage_set(self):
         data = self._read_json()
         if not isinstance(data, dict):
@@ -471,6 +656,8 @@ class StorageHandler(BaseHTTPRequestHandler):
 
         official = self._get_session()
         if official:
+            if not self._authorize_official_write(official, key, payload):
+                return
             self._write_key(key, payload)
             self._send_json(200, {'success': True})
             return
@@ -481,6 +668,9 @@ class StorageHandler(BaseHTTPRequestHandler):
         if key.startswith('requests:'):
             if not self._validate_request(payload):
                 self._send_json(400, {'error': 'Invalid request data.'})
+                return
+            if self._ref_number_taken(payload.get('refNumber', '')):
+                self._send_json(409, {'error': 'That reference number is already in use. Please file again.'})
                 return
         elif key.startswith('feedback:'):
             if not self._validate_feedback(payload):
@@ -538,14 +728,14 @@ class StorageHandler(BaseHTTPRequestHandler):
             self._store(f'officials:{official["username"]}', official)
 
         token = secrets.token_urlsafe(32)
-        self._store(f'sessions:{token}', {'username': official.get('username'), 'expires': time.time() + SESSION_TTL})
+        self._store(self._session_key(token), {'username': official.get('username'), 'expires': time.time() + SESSION_TTL})
         self._send_json(200, {'token': token, 'official': self._strip_secrets(official)})
 
     def _handle_logout(self):
         token = self._get_token()
         if token:
             with conn:
-                conn.execute('DELETE FROM kv_store WHERE key = ?', (f'sessions:{token}',))
+                conn.execute('DELETE FROM kv_store WHERE key = ?', (self._session_key(token),))
         self._send_json(200, {'success': True})
 
     def _handle_change_password(self):
@@ -671,7 +861,7 @@ class StorageHandler(BaseHTTPRequestHandler):
             self._send_json(403, {'error': 'Access denied.'})
             return
         allowed = {}
-        for field in ('photo', 'email', 'fullName', 'position'):
+        for field in ('photo', 'email', 'fullName'):
             if field in updates:
                 allowed[field] = updates[field]
         updated = dict(official)
@@ -680,6 +870,9 @@ class StorageHandler(BaseHTTPRequestHandler):
         self._send_json(200, {'ok': True, 'official': self._strip_secrets(updated)})
 
     def _handle_chat(self):
+        if REQUIRE_CHAT_AUTH and not self._get_session():
+            self._send_json(401, {'error': 'Please log in to use the chat.'})
+            return
         if self._rate_limited('chat', *RATE_LIMITS['chat']):
             return
         data = self._read_json()
@@ -842,7 +1035,9 @@ class StorageHandler(BaseHTTPRequestHandler):
         return '\n'.join(prompt_lines)
 
 
-def run(server_class=HTTPServer, handler_class=StorageHandler, port=8000):
+def run(server_class=ThreadingHTTPServer, handler_class=StorageHandler, port=None):
+    if port is None:
+        port = PORT
     server_address = ('', port)
     httpd = server_class(server_address, handler_class)
     print(f'Storage backend running on http://localhost:{port}')

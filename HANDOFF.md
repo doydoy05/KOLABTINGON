@@ -1,44 +1,50 @@
-# HANDOFF — where I left off
+## Status (all items below are DONE)
 
-Last updated: 2026-08-19
+1. **Stale `window.storage` (no auth headers)** — fixed via `main.jsx` wrapper.
+2. **Stale test** — `tests/test_model_download.py` rewritten for the current
+   backend; new `tests/test_smoke.py` boots the real server and covers
+   health, register → approve → login, request filing, duplicate refNumber
+   (409), admin-only writes (403s), hashed sessions, and list pagination.
+3. **Secrets committed** — `.gitignore` now covers `.env`, `storage.db`,
+   `backups/`, `dist/`, `__pycache__/`, `*.pyc`, `models/`; all untracked via
+   `git rm --cached` (working files kept). **Still open for the owner:**
+   rotate the exposed keys and purge git history — untracking alone is not enough.
+4. **No server-side admin enforcement** — `_authorize_official_write()` gates
+   announcements, request edits, deletes, and other-official edits on
+   `isAdmin`; `/api/update-official` is self-only (`photo/email/fullName`).
+5. **Reset code in API response** — emailed via SMTP, never returned
+   (`requestReset` no longer reads `res.code`).
+6. **`fmtDate` bug** — returns `—` for falsy timestamps.
+7. **`server.js` dead weight** — deleted; `npm run server` script removed.
 
-## Current state (working)
+## Go-live hardening (DONE, Sep 2026)
 
-- Backend `backend.py` (Python, port 8000) rewritten with auth/sessions:
-  - `/api/login`, `/api/logout`, `/api/session`, `/api/change-password`
-  - `/api/reset-request`, `/api/reset-complete`, `/api/update-official`
-  - `/api/track`, `/api/rating`, `/api/chat`
-  - `/storage/list|get|set|delete` with auth + prefix access control + rate limits
-- Login works. Verified account:
-  - `sydrick16` / `Sydrick16` (SK Treasurer, approved)
-  - `admin` — password is NOT `admin123`; stored hash doesn't match. Reset via forgot-password (code is returned in the response) or ask to reset.
-- `dist/` build is current (rebuilt 08:xx).
-- `index.html` now loads `/main.jsx` (auth header wrapper). Deleted stale `src/main.jsx` + `src/App.jsx`.
+- Backend: `PORT`/`STORAGE_DB_PATH` env support, `ThreadingHTTPServer`,
+  `/healthz`, timestamped logging, `FRONTEND_ORIGIN` CORS, `TRUST_PROXY`
+  `X-Forwarded-For` IP, optional `REQUIRE_CHAT_AUTH`, SHA-256 session tokens
+  with sliding expiry (pre-change sessions invalidated — users re-log in),
+  registration salt/hash structure + email checks, `ADMIN_*` bootstrap
+  (password + recovery email), unique `refNumber` (409), `/storage/list`
+  `limit`/`offset` pagination.
+- Frontend: `VITE_API_URL` base for all API calls; production builds never
+  fall back to `localStorage` (fail loudly); 6-char minimum on registration;
+  SEO meta/OG/favicon; image filenames normalized (`Images/*.jpg`);
+  lazily-loaded charts; `ErrorBoundary`; modal dialog semantics + Escape;
+  burger `aria-label`; privacy-consent checkbox on request filing.
+- Ops: `netlify.toml`, `public/_headers` (CSP/HSTS/frame/caching),
+  `scripts/backup_db.sh` (14 newest), `.github/workflows/ci.yml`
+  (pytest + build), `.env.example` documents all vars, README rewritten.
 
-## Pending fixes (open list)
+## Still needs the site owner (external accounts)
 
-1. **[DONE] App loaded stale `window.storage` (no auth headers)** — this was why the account couldn't open.
-   - Fixed: `index.html` -> `/main.jsx` (auth header wrapper). Deleted stale `src/main.jsx`, `src/App.jsx`. Rebuilt `dist/`.
-   - Verified: login + authed `storage/list` return 200 through the vite proxy.
-
-2. **Test is stale.** `tests/test_model_download.py` calls `backend.ensure_local_model()` which no longer exists. Fix or delete the test.
-
-3. **Secrets committed.** `.env` (real HF/DeepSeek keys) is in git. `.gitignore` only has `node_modules`.
-   - Add: `.env`, `storage.db`, `dist/`, `__pycache__/`, `models/`.
-
-4. **No server-side admin enforcement.** Any logged-in official can approve/reject others, edit any request status, post/delete announcements (`backend.py` `/storage/set`). Gate admin actions on `isAdmin`.
-
-5. **[DONE] Reset code returned in API response** (`/api/reset-request`).
-   - Now emailed to the account's Gmail via SMTP (`backend.py` `_send_email`, env: `SMTP_*`). The code is never returned in the API response; if email delivery fails, the request errors out and the reset is cleared. Frontend message updated (`java.jsx`).
-
-6. **`fmtDate` bug** — `java.jsx:59` returns a stray `”` when `ts` is falsy.
-
-7. **`server.js` is dead weight.** Old Node chat server (port 4000, no dotenv). Redundant now that `backend.py` does chat; not wired into `dev:all`.
+- Backend host + Netlify site + `VITE_API_URL` build var, custom domain/DNS, SMTP SPF/DKIM, CAPTCHA keys, Postgres when SQLite
+  outgrows a single host, key rotation + history purge (see #3).
 
 ## Commands
 
-- Backend: `python backend.py` (port 8000)
-- Frontend dev: `npm run dev` (vite, port 3000, proxies `/api` + `/storage` to 8000)
-- Everything at once: `npm start` (`dev:all`)
-- Build: `npm run build`
-- Tests: `python3 -m pytest tests/` (currently failing — see #2)
+- Backend: `python backend.py` (port from `PORT`, default 8000; `/healthz`)
+- Frontend dev: `npm run dev` (port 3000, proxies `/api` + `/storage` to 8000)
+- Everything at once: `npm start`
+- Build: `npm run build` (prod: set `VITE_API_URL` first)
+- Tests: `python3 -m pytest tests/ -q`
+- Backup: `./scripts/backup_db.sh`
