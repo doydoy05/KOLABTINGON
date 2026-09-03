@@ -140,10 +140,14 @@ def _ensure_demo_admin():
     # Production bootstrap: ADMIN_USERNAME / ADMIN_PASSWORD / ADMIN_EMAIL seed
     # (or repair) the initial admin account so the demo credentials are never
     # needed in production and the admin always has a recovery email.
+    # Set DISABLE_DEMO_ADMIN=1 once a real admin exists and the demo account
+    # has been deleted: restarts will never resurrect the demo login, but an
+    # explicit ADMIN_PASSWORD bootstrap still works.
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin').strip().lower() or 'admin'
     admin_pw = os.environ.get('ADMIN_PASSWORD', '')
     admin_email = os.environ.get('ADMIN_EMAIL', '').strip().lower()
     admin_hidden = os.environ.get('ADMIN_HIDDEN', '').lower() in ('1', 'true', 'yes')
+    demo_disabled = os.environ.get('DISABLE_DEMO_ADMIN', '').lower() in ('1', 'true', 'yes')
     key = f'officials:{admin_user}'
     row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (key,)).fetchone()
     if row and (admin_pw or admin_email or admin_hidden):
@@ -179,6 +183,8 @@ def _ensure_demo_admin():
         return
     if row:
         return
+    if demo_disabled and not admin_pw:
+        return  # demo account deleted on purpose; do not re-seed it
     salt, ph = _hash_password(admin_pw or 'admin123')
     demo = {
         'username': admin_user,
