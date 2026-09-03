@@ -596,6 +596,36 @@ export default function BarangayPortal() {
     }
   }
 
+  async function updateProfileInfo(fullName, email) {
+    if (!currentOfficial) return { ok: false, error: "You are not logged in." };
+    const name = (fullName || "").trim();
+    const mail = (email || "").trim().toLowerCase();
+    if (!name) return { ok: false, error: "Display name cannot be empty." };
+    if (mail && (!mail.includes("@") || !mail.includes("."))) {
+      return { ok: false, error: "Enter a valid Gmail address or leave it blank." };
+    }
+    try {
+      const res = await apiPost("/api/update-official", {
+        username: currentOfficial.username,
+        updates: { fullName: name, email: mail },
+      });
+      if (!res.ok) {
+        if (res.status === 401) {
+          try { localStorage.removeItem("bportal_token"); } catch {}
+          setCurrentOfficial(null);
+          setView("public");
+          return { ok: false, error: "Your session expired. Please log in again." };
+        }
+        return { ok: false, error: res.error || "Could not save your profile." };
+      }
+      setCurrentOfficial(res.official);
+      setOfficials((prev) => prev.map((o) => (o.username === res.official.username ? res.official : o)));
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "Could not save your profile. Please try again." };
+    }
+  }
+
   async function requestReset(identifier) {
     if (!identifier.trim()) return { ok: false, error: "Enter your username or Gmail address." };
     try {
@@ -749,6 +779,7 @@ export default function BarangayPortal() {
           rejectOfficial={rejectOfficial}
           changePassword={changePassword}
           updateProfilePhoto={updateProfilePhoto}
+          updateProfileInfo={updateProfileInfo}
           forcePassword={forcePassword}
           setForcePassword={setForcePassword}
           feedback={feedbackList}
@@ -1506,7 +1537,7 @@ function Dashboard({
   requests, counts, chartData, statusFilter, setStatusFilter, filteredRequests, updateStatus,
   announcements, annForm, setAnnForm, annBusy, postAnnouncement, deleteAnnouncement, officials,
   pendingOfficials, approveOfficial, rejectOfficial, changePassword, updateProfilePhoto,
-  forcePassword, setForcePassword,
+  updateProfileInfo, forcePassword, setForcePassword,
   feedback,
 }) {
   const total = requests.length;
@@ -1518,12 +1549,15 @@ function Dashboard({
   const [pwMsg, setPwMsg] = useState("");
   const [pwError, setPwError] = useState("");
   const [pwBusy, setPwBusy] = useState(false);
+  const [profileForm, setProfileForm] = useState(null);
+  const [profileMsg, setProfileMsg] = useState("");
+  const [profileError, setProfileError] = useState("");
+  const [profileBusy, setProfileBusy] = useState(false);
   const photoInputRef = useRef(null);
   const [photoMsg, setPhotoMsg] = useState("");
   const [photoError, setPhotoError] = useState("");
 
-  const handleChangePassword = async () => {
-    setPwError("");
+  const handleChangePassword = async () => {    setPwError("");
     setPwMsg("");
     if (pwForm.next !== pwForm.confirm) { setPwError("New passwords do not match."); return; }
     setPwBusy(true);
@@ -1535,6 +1569,27 @@ function Dashboard({
       if (forcePassword) setForcePassword(false);
     } else {
       setPwError(result.error);
+    }
+  };
+
+  const startProfileEdit = () => {
+    setProfileError("");
+    setProfileMsg("");
+    setProfileForm({ fullName: currentOfficial.fullName || "", email: currentOfficial.email || "" });
+  };
+
+  const handleSaveProfile = async () => {
+    if (!profileForm) return;
+    setProfileError("");
+    setProfileMsg("");
+    setProfileBusy(true);
+    const result = await updateProfileInfo(profileForm.fullName, profileForm.email);
+    setProfileBusy(false);
+    if (result.ok) {
+      setProfileMsg("Profile updated successfully.");
+      setProfileForm(null);
+    } else {
+      setProfileError(result.error);
     }
   };
 
@@ -1819,6 +1874,41 @@ function Dashboard({
         {dashTab === "settings" && (
           <>
             <h2 className="dash-title">Settings</h2>
+            <div className="dash-panel" style={{ maxWidth: 460 }}>
+              <h3><Users size={16} style={{ verticalAlign: -2, marginRight: 6 }} /> Profile</h3>
+              <p className="table-sub" style={{ marginTop: -4, marginBottom: 12 }}>
+                If a new Punong Barangay is elected, update the display name here to transfer the admin identity — no need for a new account.
+              </p>
+              {profileForm ? (
+                <>
+                  <Field label="Display name" hint="New Punong Barangay? Enter their full name here.">
+                    <input className="text-input" value={profileForm.fullName}
+                      onChange={(e) => setProfileForm((f) => ({ ...f, fullName: e.target.value }))}
+                      placeholder="e.g. Juan Dela Cruz" />
+                  </Field>
+                  <Field label="Gmail" hint="Used for password resets">
+                    <input type="email" className="text-input" value={profileForm.email}
+                      onChange={(e) => setProfileForm((f) => ({ ...f, email: e.target.value }))}
+                      placeholder="name@gmail.com" />
+                  </Field>
+                  {profileError && <p className="form-error">{profileError}</p>}
+                  {profileMsg && <p className="form-success">{profileMsg}</p>}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn-primary" disabled={profileBusy} onClick={handleSaveProfile}>
+                      {profileBusy ? <><Loader2 size={16} className="spin" /> Saving&hellip;</> : <>Save changes</>}
+                    </button>
+                    <button className="btn-ghost sm" onClick={() => { setProfileForm(null); setProfileError(""); }}>Cancel</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="track-result-row"><span>Name</span><strong>{currentOfficial.fullName}</strong></div>
+                  <div className="track-result-row"><span>Gmail</span><strong>{currentOfficial.email || "—"}</strong></div>
+                  {profileMsg && <p className="form-success">{profileMsg}</p>}
+                  <button className="btn-ghost sm" onClick={startProfileEdit}>Rename / edit profile</button>
+                </>
+              )}
+            </div>
             <div className="dash-panel" style={{ maxWidth: 460 }}>
               <h3><KeyRound size={16} style={{ verticalAlign: -2, marginRight: 6 }} /> Change password</h3>
               <Field label="Current password">

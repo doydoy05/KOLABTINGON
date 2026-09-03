@@ -146,11 +146,12 @@ def _ensure_demo_admin():
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin').strip().lower() or 'admin'
     admin_pw = os.environ.get('ADMIN_PASSWORD', '')
     admin_email = os.environ.get('ADMIN_EMAIL', '').strip().lower()
+    admin_fullname = os.environ.get('ADMIN_FULLNAME', '').strip()
     admin_hidden = os.environ.get('ADMIN_HIDDEN', '').lower() in ('1', 'true', 'yes')
     demo_disabled = os.environ.get('DISABLE_DEMO_ADMIN', '').lower() in ('1', 'true', 'yes')
     key = f'officials:{admin_user}'
     row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (key,)).fetchone()
-    if row and (admin_pw or admin_email or admin_hidden):
+    if row and (admin_pw or admin_email or admin_fullname or admin_hidden):
         try:
             rec = json.loads(row[0])
         except Exception:
@@ -164,6 +165,9 @@ def _ensure_demo_admin():
             changed = True
         if admin_email and rec.get('email') != admin_email:
             rec['email'] = admin_email
+            changed = True
+        if admin_fullname and rec.get('fullName') != admin_fullname:
+            rec['fullName'] = admin_fullname
             changed = True
         if admin_hidden and not rec.get('hidden'):
             rec['hidden'] = True
@@ -188,7 +192,7 @@ def _ensure_demo_admin():
     salt, ph = _hash_password(admin_pw or 'admin123')
     demo = {
         'username': admin_user,
-        'fullName': 'Maria Santos',
+        'fullName': admin_fullname or 'Maria Santos',
         'position': 'Punong Barangay',
         'isAdmin': True,
         'status': 'approved',
