@@ -21,7 +21,13 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
-DB_PATH = os.environ.get('STORAGE_DB_PATH', os.path.join(os.path.dirname(__file__), 'storage.db'))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_DB_PATH_RAW = os.environ.get('STORAGE_DB_PATH', '') or os.path.join(BASE_DIR, 'storage.db')
+# A relative STORAGE_DB_PATH is resolved against the backend file — never the
+# process working directory — so launching from a different folder (VS Code
+# run configs, cron, host consoles) can never silently switch databases and
+# make officials "disappear" into a fresh file.
+DB_PATH = _DB_PATH_RAW if os.path.isabs(_DB_PATH_RAW) else os.path.join(BASE_DIR, _DB_PATH_RAW)
 PORT = int(os.environ.get('PORT', '8000') or 8000)
 # Production frontend origin for CORS. Defaults to '*' for local dev only.
 FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
@@ -279,9 +285,12 @@ def _send_email(to_addr, subject, body):
 
 
 def _ensure_demo_admin():
-    # Production bootstrap: ADMIN_USERNAME / ADMIN_PASSWORD / ADMIN_EMAIL seed
-    # (or repair) the initial admin account so the demo credentials are never
-    # needed in production and the admin always has a recovery email.
+    # Seed-only bootstrap. An existing admin row is NEVER rewritten from env
+    # on an ordinary restart, so dashboard renames and password changes survive
+    # code edits, restarts, and redeploys. (Previously any ADMIN_* env value
+    # reset the stored account on every boot.) To force the env values back
+    # onto the admin account — e.g. lockout recovery — restart once with
+    # ADMIN_REPAIR=1, then unset it.
     # Set DISABLE_DEMO_ADMIN=1 once a real admin exists and the demo account
     # has been deleted: restarts will never resurrect the demo login, but an
     # explicit ADMIN_PASSWORD bootstrap still works.
@@ -290,44 +299,37 @@ def _ensure_demo_admin():
     admin_email = os.environ.get('ADMIN_EMAIL', '').strip().lower()
     admin_fullname = os.environ.get('ADMIN_FULLNAME', '').strip()
     admin_hidden = os.environ.get('ADMIN_HIDDEN', '').lower() in ('1', 'true', 'yes')
+    repair = os.environ.get('ADMIN_REPAIR', '').lower() in ('1', 'true', 'yes')
     demo_disabled = os.environ.get('DISABLE_DEMO_ADMIN', '').lower() in ('1', 'true', 'yes')
     key = f'officials:{admin_user}'
     row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (key,)).fetchone()
-    if row and (admin_pw or admin_email or admin_fullname or admin_hidden):
+    if row:
+        if not repair:
+            return  # existing data always wins; other officials are never touched here
         try:
             rec = json.loads(row[0])
         except Exception:
             rec = {}
-        changed = False
         if admin_pw:
             salt, ph = _hash_password(admin_pw)
             rec['salt'] = salt
             rec['passwordHash'] = ph
             rec.pop('password', None)
-            changed = True
-        if admin_email and rec.get('email') != admin_email:
+        if admin_email:
             rec['email'] = admin_email
-            changed = True
-        if admin_fullname and rec.get('fullName') != admin_fullname:
+        if admin_fullname:
             rec['fullName'] = admin_fullname
-            changed = True
-        if admin_hidden and not rec.get('hidden'):
+        if admin_hidden:
             rec['hidden'] = True
-            changed = True
-        if rec.get('status') != 'approved' or not rec.get('isAdmin'):
-            rec['status'] = 'approved'
-            rec['isAdmin'] = True
-            changed = True
-        if changed:
-            rec['username'] = admin_user
-            with conn:
-                conn.execute(
-                    'INSERT INTO kv_store (key, value) VALUES (?, ?) '
-                    'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
-                    (key, json.dumps(rec)),
-                )
-        return
-    if row:
+        rec['username'] = admin_user
+        rec['status'] = 'approved'
+        rec['isAdmin'] = True
+        with conn:
+            conn.execute(
+                'INSERT INTO kv_store (key, value) VALUES (?, ?) '
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                (key, json.dumps(rec)),
+            )
         return
     if demo_disabled and not admin_pw:
         return  # demo account deleted on purpose; do not re-seed it
@@ -351,7 +353,73 @@ def _ensure_demo_admin():
         conn.execute('INSERT INTO kv_store (key, value) VALUES (?, ?)', (key, json.dumps(demo)))
 
 
+_snapshot_last = 0.0
+_SNAPSHOT_MIN_INTERVAL = 60  # seconds between mutation-triggered snapshots
+
+
+def _maybe_snapshot_data():
+    """Snapshot at most once a minute: data created during uptime is covered,
+    but hot keys (sessions) never trigger one — see _store()."""
+    global _snapshot_last
+    now = time.time()
+    if now - _snapshot_last < _SNAPSHOT_MIN_INTERVAL:
+        return
+    _snapshot_last = now
+    _snapshot_data()
+
+
+def _snapshot_data():
+    """Write a JSON snapshot of every stored key next to the database on boot.
+
+    Cheap insurance: if the database file is ever wiped (fresh clone, host
+    redeploy without a persistent disk), the latest snapshot plus
+    `scripts/restore_data.py` brings officials, requests, and announcements
+    back. Only the 5 newest snapshots are kept. Never fails the boot.
+    """
+    try:
+        rows = conn.execute('SELECT key, value FROM kv_store').fetchall()
+        snap_dir = os.path.join(os.path.dirname(DB_PATH), 'backups')
+        os.makedirs(snap_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        path = os.path.join(snap_dir, f'boot-{stamp}.json')
+        with open(path, 'w', encoding='utf-8') as fh:
+            json.dump({'takenAt': stamp, 'data': {k: v for (k, v) in rows}}, fh)
+        snaps = sorted(
+            (os.path.join(snap_dir, f) for f in os.listdir(snap_dir)
+             if f.startswith('boot-') and f.endswith('.json')),
+            key=os.path.getmtime,
+        )
+        for old in snaps[:-5]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        return path, len(rows)
+    except Exception as exc:
+        sys.stderr.write(f'data snapshot skipped: {exc}\n')
+        return None, 0
+
+
+def _log_boot_summary():
+    """Log which database is in use and what it holds, so a wrong/empty file
+    is obvious in the host logs instead of surfacing as 'my officials are gone'."""
+    try:
+        rows = conn.execute('SELECT key FROM kv_store').fetchall()
+    except Exception as exc:
+        sys.stderr.write(f'boot check failed for {DB_PATH}: {exc}\n')
+        return
+    counts = {}
+    for (k,) in rows:
+        prefix = k.split(':', 1)[0] if ':' in k else '(other)'
+        counts[prefix] = counts.get(prefix, 0) + 1
+    detail = ', '.join(f'{v} {k}' for k, v in sorted(counts.items())) or 'empty'
+    fresh = ' (fresh database)' if len(rows) <= 1 else ''
+    print(f'Using database: {DB_PATH} [{detail}]{fresh}')
+
+
 _ensure_demo_admin()
+_log_boot_summary()
+_snapshot_data()
 
 
 class StorageHandler(BaseHTTPRequestHandler):
@@ -494,6 +562,10 @@ class StorageHandler(BaseHTTPRequestHandler):
                 'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
                 (key, json.dumps(payload))
             )
+        # Sessions/resets churn constantly; snapshot everything else (throttled
+        # to once a minute) so data created during uptime survives a later wipe.
+        if not (key.startswith('sessions:') or key.startswith('resets:')):
+            _maybe_snapshot_data()
 
     def _write_key(self, key, payload):
         """Write a key, merging safely for officials records so secrets survive."""

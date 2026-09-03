@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useCallback, useRef, Suspense } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
 import {
   Menu, X, FileCheck2, Receipt, HeartHandshake, Home, Briefcase, BadgeCheck,
   AlertCircle, MessageSquare, Search, ShieldCheck, LogIn, UserPlus, LogOut,
   ClipboardList, Megaphone, Users, LayoutDashboard, ChevronRight, ChevronDown,
   CheckCircle2, Clock, PackageCheck, XCircle, Plus, Trash2, Building2, Star,
   MapPin, Phone, Mail, Loader2, Pin as PinIcon, Settings, KeyRound, Mail as MailIcon,
-  MessageSquareHeart, Send, EyeOff, Camera,
+  MessageSquareHeart, Send, EyeOff, Camera, ExternalLink,
 } from "lucide-react";
 // Charts load lazily so the public landing page never downloads the chart library.
 const RequestsChart = React.lazy(() =>
@@ -213,6 +213,88 @@ function Modal({ onClose, children, width = 480, dark = false, label = "Dialog" 
         </button>
         {children}
       </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/*  In-app browser helper (Messenger / Facebook / Instagram …)            */
+/* ---------------------------------------------------------------------- */
+/* Tapping a shared link inside Messenger opens it in Messenger's own
+   mini-browser instead of Chrome/Safari — that is why the link seems to
+   "not open directly". This banner detects those mini-browsers and gives a
+   one-tap way out (Android) or short instructions (iPhone). */
+function detectInAppBrowser(ua = "") {
+  const apps = [
+    [/Messenger/i, "Messenger"],
+    [/Instagram/i, "Instagram"],
+    [/FBAN|FBAV|FB_IAB|FB4A/i, "Facebook"],
+    [/Line\//i, "Line"],
+    [/TikTok|Musical\.ly/i, "TikTok"],
+    [/Twitter/i, "Twitter"],
+    [/Snapchat/i, "Snapchat"],
+    [/Pinterest/i, "Pinterest"],
+    [/WhatsApp/i, "WhatsApp"],
+    [/Viber/i, "Viber"],
+    [/Telegram/i, "Telegram"],
+  ];
+  let app = "";
+  for (const [re, name] of apps) {
+    if (re.test(ua)) { app = name; break; }
+  }
+  if (!app) return { inApp: false };
+  return {
+    inApp: true,
+    app,
+    isAndroid: /Android/i.test(ua),
+    isiOS: /iPhone|iPad|iPod/i.test(ua),
+  };
+}
+
+function InAppBanner() {
+  const [dismissed, setDismissed] = useState(false);
+  const info = useMemo(() => {
+    try {
+      return detectInAppBrowser(navigator.userAgent || "");
+    } catch {
+      return { inApp: false };
+    }
+  }, []);
+  if (!info.inApp || dismissed) return null;
+
+  const openInChrome = () => {
+    // Android intent URLs break out of Messenger/Facebook into real Chrome
+    // (must run from a tap, which this is). Falls back to the same page.
+    try {
+      const u = new URL(window.location.href);
+      const fallback = encodeURIComponent(u.toString());
+      window.location.href =
+        `intent://${u.host}${u.pathname}${u.search}` +
+        `#Intent;scheme=${u.protocol.replace(":", "")};package=com.android.chrome;` +
+        `S.browser_fallback_url=${fallback};end`;
+    } catch {
+      /* keep the user on the page with the instructions below */
+    }
+  };
+
+  return (
+    <div className="iab-banner" role="note">
+      <div className="iab-text">
+        <strong>You're viewing this inside {info.app}.</strong>{" "}
+        {info.isAndroid ? (
+          <span>Tap below to open the portal directly in Chrome.</span>
+        ) : (
+          <span>Tap ⋯ (or Share) at the top, then “Open in Safari” or “Open in Chrome”.</span>
+        )}
+      </div>
+      {info.isAndroid && (
+        <button className="iab-btn" onClick={openInChrome}>
+          <ExternalLink size={14} /> Open in Chrome
+        </button>
+      )}
+      <button className="iab-close" onClick={() => setDismissed(true)} aria-label="Dismiss">
+        <X size={16} />
+      </button>
     </div>
   );
 }
@@ -770,6 +852,7 @@ export default function BarangayPortal() {
   return (
     <div className="portal-root">
       <FontsAndStyles />
+      <InAppBanner />
 
       {view === "public" ? (
         <PublicSite
@@ -2189,6 +2272,17 @@ function FontsAndStyles() {
       #announcements .section-heading .eyebrow { color:#000; }
       #officials .section-heading .eyebrow { color:#000; }
       .empty-note { color:var(--ink-light); font-size:14px; }
+      /* In-app browser helper (Messenger/Facebook mini-browser escape) */
+      .iab-banner { position:sticky; top:0; z-index:200; display:flex; align-items:center; gap:10px;
+        background:var(--teal); color:#fff; padding:10px 14px; font-size:13px; line-height:1.45;
+        box-shadow:0 2px 10px rgba(0,0,0,.25); }
+      .iab-text { flex:1; }
+      .iab-btn { display:inline-flex; align-items:center; gap:6px; white-space:nowrap;
+        background:#fff; color:var(--teal); border:none; border-radius:999px;
+        font-weight:700; font-size:13px; padding:8px 14px; cursor:pointer; }
+      .iab-close { background:transparent; border:none; color:#fff; opacity:.85; cursor:pointer;
+        padding:6px; border-radius:8px; line-height:0; }
+      .iab-close:hover { opacity:1; }
       .loading-row { display:flex; align-items:center; gap:8px; color:var(--ink-light); font-size:14px; }
 
       /* Services */

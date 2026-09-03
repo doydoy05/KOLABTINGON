@@ -7,9 +7,22 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python backend.py
-    # Local Llama model is intentionally NOT used on Render (no model file is
-    # deployed); chat runs through DEEPSEEK_API_KEY / HF_API_KEY instead.
+    # --- Data survival (read this!) ---
+    # SQLite lives wherever STORAGE_DB_PATH points. Render's default filesystem
+    # is EPHEMERAL: every redeploy wipes storage.db and the backend re-seeds a
+    # fresh demo admin — that is why accounts "disappear" after a push.
+    # Fix (needs a paid instance): uncomment the disk below AND set
+    # STORAGE_DB_PATH=/data/storage.db in envVars. Snapshots in /data/backups
+    # plus scripts/restore_data.py remain your safety net either way.
+    #disk:
+    #  name: bportal-data
+    #  mountPath: /data
+    #  sizeGB: 1
     envVars:
+      # - key: STORAGE_DB_PATH
+      #   value: /data/storage.db # <-- uncomment together with the disk above
+      # Local Llama model is intentionally NOT used on Render (no model file is
+      # deployed); chat runs through DEEPSEEK_API_KEY / HF_API_KEY instead.
       - key: FRONTEND_ORIGIN
         value: https://your-site.netlify.app # <-- replace after Netlify deploy
       - key: TRUST_PROXY
