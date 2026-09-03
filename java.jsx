@@ -230,6 +230,7 @@ export default function BarangayPortal() {
   const [announcements, setAnnouncements] = useState([]);
   const [officials, setOfficials] = useState([]);
   const [pendingOfficials, setPendingOfficials] = useState([]);
+  const [rejectedOfficials, setRejectedOfficials] = useState([]);
 
   const [authOpen, setAuthOpen] = useState(false);
   const [authTab, setAuthTab] = useState("login");
@@ -301,7 +302,8 @@ export default function BarangayPortal() {
       const visible = valid.filter(o => !o.hidden);
       setOfficials(visible.filter(o => o.status === "approved").sort((a, b) => a.dateJoined - b.dateJoined));
       setPendingOfficials(visible.filter(o => o.status === "pending").sort((a, b) => a.dateJoined - b.dateJoined));
-    } catch { setOfficials([]); setPendingOfficials([]); }
+      setRejectedOfficials(visible.filter(o => o.status === "rejected").sort((a, b) => a.dateJoined - b.dateJoined));
+    } catch { setOfficials([]); setPendingOfficials([]); setRejectedOfficials([]); }
   }, []);
 
   const loadFeedback = useCallback(async () => {
@@ -354,14 +356,23 @@ export default function BarangayPortal() {
     })();
   }, [loadRequests, loadAnnouncements, loadOfficials, loadFeedback, loadPublicRating]);
 
-  /* Poll the backend while a ticket is showing so status updates from staff appear live */
+  /* Poll the backend while a ticket is showing so status updates from staff appear live.
+     Kept gentle on purpose: 20s cadence, skipped while the tab is hidden, and
+     backs off for a while after a 429 so background tabs can't throttle the site. */
   useEffect(() => {
     if (tickets.length === 0) return;
     let cancelled = false;
+    let coolUntil = 0;
     const poll = async () => {
+      if (cancelled || document.hidden) return;
+      if (Date.now() < coolUntil) return;
       const latest = await Promise.all(tickets.map(async (t) => {
         try {
           const res = await apiGet(`/api/track?ref=${encodeURIComponent(t.refNumber)}`);
+          if (res.status === 429) {
+            coolUntil = Date.now() + (Number(res.retryAfter) || 30) * 1000;
+            return t;
+          }
           return res.ok && res.request ? res.request : t;
         } catch { return t; }
       }));
@@ -369,7 +380,7 @@ export default function BarangayPortal() {
       setTickets(latest);
       setRequests((prev) => prev.map((x) => latest.find((l) => l.id === x.id) || x));
     };
-    const timer = setInterval(poll, 5000);
+    const timer = setInterval(poll, 20000);
     return () => { cancelled = true; clearInterval(timer); };
   }, [tickets.map((t) => t.id).join(",")]);
 
@@ -470,14 +481,14 @@ export default function BarangayPortal() {
     setAuthBusy(true);
     const username = form.username.trim().toLowerCase();
 
-    // Check if username or Gmail already exists (approved or pending)
-    const sameUsername = officials.find(o => o.username === username) || pendingOfficials.find(o => o.username === username);
+    // Check if username or Gmail already exists (approved, pending, or rejected)
+    const sameUsername = officials.find(o => o.username === username) || pendingOfficials.find(o => o.username === username) || rejectedOfficials.find(o => o.username === username);
     if (sameUsername) {
       setAuthError("That username is already taken. Please choose another.");
       setAuthBusy(false);
       return;
     }
-    const sameEmail = officials.find(o => o.email && o.email.toLowerCase() === email) || pendingOfficials.find(o => o.email && o.email.toLowerCase() === email);
+    const sameEmail = officials.find(o => o.email && o.email.toLowerCase() === email) || pendingOfficials.find(o => o.email && o.email.toLowerCase() === email) || rejectedOfficials.find(o => o.email && o.email.toLowerCase() === email);
     if (sameEmail) {
       setAuthError("That Gmail address is already registered. Please use another.");
       setAuthBusy(false);
@@ -520,7 +531,13 @@ export default function BarangayPortal() {
         password: form.password,
       });
       if (!res.ok) {
-        setAuthError(res.error || "Login failed.");
+        if (res.status === 429 && res.retryAfter) {
+          const secs = Number(res.retryAfter) || 0;
+          const wait = secs >= 60 ? `about ${Math.max(1, Math.round(secs / 60))} minute(s)` : `${secs} seconds`;
+          setAuthError(`${res.error || "Too many login attempts."} Please wait ${wait} — then one correct login clears it.`);
+        } else {
+          setAuthError(res.error || "Login failed.");
+        }
         setAuthBusy(false);
         return;
       }
@@ -669,9 +686,33 @@ export default function BarangayPortal() {
     if (!target) return;
     const updated = { ...target, status: "rejected" };
     setPendingOfficials((prev) => prev.filter((o) => o.username !== username));
+    setRejectedOfficials((prev) => [...prev, updated].sort((a, b) => a.dateJoined - b.dateJoined));
     try {
       await window.storage.set(`officials:${username}`, JSON.stringify(updated), true);
     } catch { loadOfficials(); }
+  }
+
+  async function deleteOfficialAccount(username) {
+    if (!currentOfficial || !currentOfficial.isAdmin) return;
+    if (username === currentOfficial.username) return; // admins can't delete themselves
+    const target =
+      officials.find((o) => o.username === username) ||
+      pendingOfficials.find((o) => o.username === username) ||
+      rejectedOfficials.find((o) => o.username === username);
+    if (!target) return;
+    const label = target.fullName ? `${target.fullName} (@${target.username})` : `@${username}`;
+    if (!window.confirm(`Permanently delete ${label}'s account? They will lose dashboard access immediately and this cannot be undone.`)) return;
+    // Optimistic removal so the UI feels instant; reload on failure.
+    setOfficials((prev) => prev.filter((o) => o.username !== username));
+    setPendingOfficials((prev) => prev.filter((o) => o.username !== username));
+    setRejectedOfficials((prev) => prev.filter((o) => o.username !== username));
+    try {
+      const ok = await window.storage.delete(`officials:${username}`, true);
+      if (!ok) throw new Error("delete rejected");
+    } catch {
+      loadOfficials();
+      window.alert("Could not delete that account. Please try again.");
+    }
   }
 
   async function updateStatus(id, status) {
@@ -775,8 +816,10 @@ export default function BarangayPortal() {
           deleteAnnouncement={deleteAnnouncement}
           officials={officials}
           pendingOfficials={pendingOfficials}
+          rejectedOfficials={rejectedOfficials}
           approveOfficial={approveOfficial}
           rejectOfficial={rejectOfficial}
+          deleteOfficialAccount={deleteOfficialAccount}
           changePassword={changePassword}
           updateProfilePhoto={updateProfilePhoto}
           updateProfileInfo={updateProfileInfo}
@@ -883,6 +926,10 @@ function PublicSite({
       const payload = await response.json();
       if (payload.reply) {
         appendChatMessage("bot", payload.reply);
+      } else if (response.status === 429) {
+        const secs = Number(payload.retryAfter) || 30;
+        const wait = secs >= 60 ? `about ${Math.max(1, Math.round(secs / 60))} minute(s)` : `${secs} second(s)`;
+        appendChatMessage("bot", `You're sending messages too quickly. Please wait ${wait} and try again.`);
       } else if (payload.error) {
         appendChatMessage("bot", payload.error);
       } else {
@@ -1536,7 +1583,7 @@ function Dashboard({
   currentOfficial, handleLogout, dashTab, setDashTab, setView,
   requests, counts, chartData, statusFilter, setStatusFilter, filteredRequests, updateStatus,
   announcements, annForm, setAnnForm, annBusy, postAnnouncement, deleteAnnouncement, officials,
-  pendingOfficials, approveOfficial, rejectOfficial, changePassword, updateProfilePhoto,
+  pendingOfficials, rejectedOfficials = [], approveOfficial, rejectOfficial, deleteOfficialAccount, changePassword, updateProfilePhoto,
   updateProfileInfo, forcePassword, setForcePassword,
   feedback,
 }) {
@@ -1844,7 +1891,8 @@ function Dashboard({
                         </div>
                         <div className="pending-actions">
                           <button className="btn-primary sm" onClick={() => approveOfficial(o.username)}><CheckCircle2 size={14} /> Approve</button>
-                          <button className="icon-btn danger" onClick={() => rejectOfficial(o.username)} aria-label="Reject"><X size={15} /></button>
+                          <button className="icon-btn danger" onClick={() => rejectOfficial(o.username)} aria-label="Reject" title="Reject"><X size={15} /></button>
+                          <button className="icon-btn danger" onClick={() => deleteOfficialAccount(o.username)} aria-label={`Delete ${o.fullName}'s registration`} title="Delete registration permanently"><Trash2 size={15} /></button>
                         </div>
                       </div>
                     ))}
@@ -1854,7 +1902,7 @@ function Dashboard({
             )}
             <div className="table-wrap">
               <table className="dash-table">
-                <thead><tr><th>Name</th><th>Position</th><th>Username</th><th>Gmail</th><th>Joined</th></tr></thead>
+                <thead><tr><th>Name</th><th>Position</th><th>Username</th><th>Gmail</th><th>Joined</th>{currentOfficial.isAdmin && <th>Action</th>}</tr></thead>
                 <tbody>
                   {officials.map((o) => (
                     <tr key={o.username}>
@@ -1863,11 +1911,41 @@ function Dashboard({
                       <td className="mono-tag">{o.username}</td>
                       <td className="table-sub">{o.email || "—"}</td>
                       <td className="table-sub">{fmtDate(o.dateJoined)}</td>
+                      {currentOfficial.isAdmin && (
+                        <td>
+                          {o.username === currentOfficial.username ? (
+                            <span className="table-sub" title="You cannot delete your own account">—</span>
+                          ) : (
+                            <button className="icon-btn danger" onClick={() => deleteOfficialAccount(o.username)} aria-label={`Delete ${o.fullName}'s account`} title="Delete account permanently"><Trash2 size={15} /></button>
+                          )}
+                        </td>
+                      )}
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
+            {currentOfficial.isAdmin && rejectedOfficials.length > 0 && (
+              <div className="dash-panel">
+                <h3>Rejected registrations</h3>
+                <p className="table-sub" style={{ marginTop: -4, marginBottom: 12 }}>
+                  Rejected accounts stay blocked from re-registering until you delete them permanently.
+                </p>
+                <div className="pending-list">
+                  {rejectedOfficials.map((o) => (
+                    <div key={o.username} className="pending-row">
+                      <div className="pending-info">
+                        <div className="official-name"><OfficialAvatar official={o} sm /> {o.fullName}</div>
+                        <div className="table-sub">{o.position} &middot; @{o.username}{o.email ? ` &middot; ${o.email}` : ""} &middot; applied {fmtDate(o.dateJoined)}</div>
+                      </div>
+                      <div className="pending-actions">
+                        <button className="icon-btn danger" onClick={() => deleteOfficialAccount(o.username)} aria-label={`Delete ${o.fullName}'s rejected account`} title="Delete account permanently"><Trash2 size={15} /></button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </>
         )}
 

@@ -3,6 +3,7 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 import datetime
+import ipaddress
 import json
 import os
 import time
@@ -12,6 +13,7 @@ import secrets
 import smtplib
 import sqlite3
 import sys
+import threading
 from collections import defaultdict
 from email.message import EmailMessage
 from dotenv import load_dotenv
@@ -23,9 +25,13 @@ DB_PATH = os.environ.get('STORAGE_DB_PATH', os.path.join(os.path.dirname(__file_
 PORT = int(os.environ.get('PORT', '8000') or 8000)
 # Production frontend origin for CORS. Defaults to '*' for local dev only.
 FRONTEND_ORIGIN = os.environ.get('FRONTEND_ORIGIN', '*')
-# Set TRUST_PROXY=1 when running behind a reverse proxy / host load balancer so
-# rate limiting sees the real client IP via X-Forwarded-For.
-TRUST_PROXY = os.environ.get('TRUST_PROXY', '').lower() in ('1', 'true', 'yes')
+# The backend almost always runs behind Render / Netlify / a load balancer, so
+# proxy headers are trusted by default — otherwise every visitor looks like one
+# IP, shares a single rate-limit bucket, and trips 429s together. Set
+# TRUST_PROXY=0 only when the backend is directly exposed to the internet and
+# you want to ignore a possibly spoofed X-Forwarded-For header.
+_TRUST_PROXY_RAW = os.environ.get('TRUST_PROXY', '').strip().lower()
+TRUST_PROXY = _TRUST_PROXY_RAW not in ('0', 'false', 'no', 'off')
 # Set REQUIRE_CHAT_AUTH=1 to require a logged-in session for /api/chat
 # (recommended in production so anonymous visitors can't burn model quota).
 REQUIRE_CHAT_AUTH = os.environ.get('REQUIRE_CHAT_AUTH', '').lower() in ('1', 'true', 'yes')
@@ -62,8 +68,86 @@ except ImportError:
 except Exception as exc:
     LOCAL_LLAMA_ERROR = f'Local Llama initialization failed: {exc}'
 
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-conn.execute('PRAGMA foreign_keys = ON')
+_db_lock = threading.RLock()
+
+_raw_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+# Concurrency for a hall of ~15-20 simultaneous users: WAL lets readers run
+# alongside the single writer, busy_timeout turns momentary contention into a
+# short wait instead of 'database is locked', and NORMAL sync keeps WAL fast
+# (backups use the SQLite backup API, which is WAL-safe).
+_raw_conn.execute('PRAGMA journal_mode = WAL')
+_raw_conn.execute('PRAGMA busy_timeout = 5000')
+_raw_conn.execute('PRAGMA synchronous = NORMAL')
+_raw_conn.execute('PRAGMA foreign_keys = ON')
+
+
+class _Rows(list):
+    """Eagerly-fetched result rows (supports the fetchone/fetchall calls used
+    throughout the handlers). Materializing rows inside the lock means no
+    cursor is ever touched by two threads at once."""
+
+    def fetchone(self):
+        return self[0] if self else None
+
+    def fetchall(self):
+        return list(self)
+
+
+class _LockedConnection:
+    """Serialize all SQLite access across handler threads.
+
+    ThreadingHTTPServer runs each request on its own thread, but a pysqlite
+    connection (and its cursors) must not be used concurrently: one thread
+    reading a cursor while another executes is an InterfaceError and drops
+    the response. So SELECTs are executed *and fully fetched* under one lock
+    and callers only ever touch the detached _Rows. Every operation here is a
+    few milliseconds, so one lock easily serves 15-20 simultaneous users.
+    Transaction blocks (`with conn:`) keep sqlite3 semantics: commit on
+    success, rollback on error — just held under the lock for their duration.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._lock = _db_lock
+
+    def execute(self, *args, **kwargs):
+        with self._lock:
+            cur = self._inner.execute(*args, **kwargs)
+            if cur.description is None:
+                return _Rows()
+            return _Rows(cur.fetchall())
+
+    def executemany(self, *args, **kwargs):
+        with self._lock:
+            return self._inner.executemany(*args, **kwargs)
+
+    def commit(self):
+        with self._lock:
+            return self._inner.commit()
+
+    def rollback(self):
+        with self._lock:
+            return self._inner.rollback()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._inner.commit()
+            else:
+                self._inner.rollback()
+        finally:
+            self._lock.release()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+conn = _LockedConnection(_raw_conn)
 
 with conn:
     conn.execute('CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
@@ -75,20 +159,78 @@ SESSION_TTL = 12 * 60 * 60          # session lifetime
 MAX_VALUE_BYTES = 256 * 1024        # max stored value size
 PBKDF2_ITERATIONS = 100000          # must match the frontend hashing settings
 
-# per-IP rate limits: scope -> (limit, window_seconds)
+def _env_int(name, default):
+    try:
+        val = int(os.environ.get(name, '') or default)
+        return val if val > 0 else default
+    except (ValueError, TypeError):
+        return default
+
+# Per-scope rate limits: scope -> (limit, window_seconds). Each is
+# env-overridable (e.g. RATE_LIMIT_TRACK / RATE_LIMIT_TRACK_WINDOW).
+# Defaults are sized for a small public site where many visitors may share one
+# egress IP (barangay hall, schools): anonymous filing + feedback +
+# registration share 'set', and the ticket tracker polls in the background so
+# 'track' is roomy. Legit users should never see a 429.
 RATE_LIMITS = {
-    'set': (20, 60),
-    'chat': (30, 60),
-    'login': (10, 900),
-    'reset': (5, 900),
-    'track': (120, 60),
-    'rating': (120, 60),
+    'set': (_env_int('RATE_LIMIT_SET', 120), _env_int('RATE_LIMIT_SET_WINDOW', 60)),
+    'chat': (_env_int('RATE_LIMIT_CHAT', 120), _env_int('RATE_LIMIT_CHAT_WINDOW', 60)),
+    'login': (_env_int('RATE_LIMIT_LOGIN', 120), _env_int('RATE_LIMIT_LOGIN_WINDOW', 300)),
+    'reset': (_env_int('RATE_LIMIT_RESET', 10), _env_int('RATE_LIMIT_RESET_WINDOW', 900)),
+    'track': (_env_int('RATE_LIMIT_TRACK', 300), _env_int('RATE_LIMIT_TRACK_WINDOW', 60)),
+    'rating': (_env_int('RATE_LIMIT_RATING', 300), _env_int('RATE_LIMIT_RATING_WINDOW', 60)),
 }
 
+# Login throttle (env-overridable). Two layers so legit users never notice:
+#  - per-IP: generous, counts every attempt (bot protection for shared office IPs).
+#  - per-account failures: only WRONG passwords consume quota; correct logins
+#    clear both buckets. Typos never lock you out — only sustained guessing does.
+LOGIN_IP_LIMIT = _env_int('LOGIN_IP_LIMIT', RATE_LIMITS['login'][0])
+LOGIN_IP_WINDOW = _env_int('LOGIN_IP_WINDOW', RATE_LIMITS['login'][1])
+LOGIN_FAIL_LIMIT = _env_int('LOGIN_FAIL_LIMIT', 20)
+LOGIN_FAIL_WINDOW = _env_int('LOGIN_FAIL_WINDOW', 900)
+
 _rate_buckets = defaultdict(list)
+_rate_calls = 0
+
+
+def _maybe_sweep_rate_buckets():
+    """Bound memory: drop long-expired buckets every so often so the in-memory
+    throttle map can't grow without bound on a long-lived server."""
+    global _rate_calls
+    _rate_calls += 1
+    if len(_rate_buckets) <= 5000 or _rate_calls % 500 != 0:
+        return
+    now = time.time()
+    for key in list(_rate_buckets):
+        bucket = _rate_buckets[key]
+        bucket[:] = [t for t in bucket if t > now - 3600]
+        if not bucket:
+            _rate_buckets.pop(key, None)
+
+
+def _clear_rate_limit(scope, key):
+    _rate_buckets.pop(f'{scope}:{key}', None)
+
+
+def _bucket_hits(scope, key, window):
+    _maybe_sweep_rate_buckets()
+    now = time.time()
+    bucket = _rate_buckets.setdefault(f'{scope}:{key}', [])
+    bucket[:] = [t for t in bucket if t > now - window]
+    return bucket
+
+
+def _rate_retry_after(scope, key, window):
+    bucket = _bucket_hits(scope, key, window)
+    if not bucket:
+        return 0
+    oldest = min(bucket)
+    return max(1, int(oldest + window - time.time()) + 1)
 
 
 def _rate_limit(scope, key, limit, window):
+    _maybe_sweep_rate_buckets()
     now = time.time()
     bucket = _rate_buckets.setdefault(f'{scope}:{key}', [])
     bucket[:] = [t for t in bucket if t > now - window]
@@ -223,12 +365,14 @@ class StorageHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         sys.stderr.write('%s - %s\n' % (datetime.datetime.now().isoformat(timespec='seconds'), fmt % args))
 
-    def _set_headers(self, status=200, content_type='application/json'):
+    def _set_headers(self, status=200, content_type='application/json', extra_headers=None):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Access-Control-Allow-Origin', FRONTEND_ORIGIN)
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        for k, v in (extra_headers or {}).items():
+            self.send_header(k, str(v))
         self.end_headers()
 
     def _read_json(self):
@@ -239,23 +383,42 @@ class StorageHandler(BaseHTTPRequestHandler):
         except Exception:
             return None
 
-    def _send_json(self, status, payload):
-        self._set_headers(status)
+    def _send_json(self, status, payload, extra_headers=None):
+        self._set_headers(status, extra_headers=extra_headers)
         self.wfile.write(json.dumps(payload).encode('utf-8'))
 
     def _client_ip(self):
         if TRUST_PROXY:
             forwarded = self.headers.get('X-Forwarded-For', '')
-            if forwarded:
-                # Left-most entry is the original client; validate loosely.
-                candidate = forwarded.split(',')[0].strip()
-                if candidate and len(candidate) < 64:
+            # Left-most entry is the original client. Only accept values that
+            # parse as a real IP so garbage falls back to the direct peer.
+            for part in forwarded.split(','):
+                candidate = part.strip().strip('[]')
+                if not candidate:
+                    continue
+                try:
+                    ipaddress.ip_address(candidate)
                     return candidate
+                except ValueError:
+                    pass
+                # Tolerate trailing ':port' on IPv4 (IPv6 contains many colons
+                # so it is never stripped this way).
+                if candidate.count(':') == 1:
+                    host = candidate.rsplit(':', 1)[0].strip().strip('[]')
+                    try:
+                        ipaddress.ip_address(host)
+                        return host
+                    except ValueError:
+                        continue
         return self.client_address[0]
 
-    def _rate_limited(self, scope, limit, window):
-        if not _rate_limit(scope, self._client_ip(), limit, window):
-            self._send_json(429, {'error': 'Too many requests. Please slow down.'})
+    def _rate_limited(self, scope, limit, window, message=None, key=None):
+        who = key if key is not None else self._client_ip()
+        if not _rate_limit(scope, who, limit, window):
+            retry_after = _rate_retry_after(scope, who, window)
+            self._send_json(429, {'error': message or 'Too many requests. Please slow down.',
+                                  'retryAfter': retry_after},
+                            extra_headers={'Retry-After': retry_after} if retry_after else None)
             return True
         return False
 
@@ -310,9 +473,12 @@ class StorageHandler(BaseHTTPRequestHandler):
         official = self._get_official(session.get('username', ''))
         if not official or official.get('status') != 'approved':
             return None
-        # Sliding expiry: activity extends the session.
-        session['expires'] = time.time() + SESSION_TTL
-        self._store(key, session)
+        # Sliding expiry: activity extends the session, but the new expiry is
+        # only persisted once under half the TTL remains — otherwise every
+        # dashboard poll by every user would be a DB write.
+        if session.get('expires', 0) - time.time() < SESSION_TTL / 2:
+            session['expires'] = time.time() + SESSION_TTL
+            self._store(key, session)
         return official
 
     def _strip_secrets(self, official):
@@ -593,6 +759,50 @@ class StorageHandler(BaseHTTPRequestHandler):
             if not bool(official.get('isAdmin')):
                 self._send_json(403, {'error': 'Admin access required.'})
                 return
+            if key.startswith('officials:'):
+                target_name = key.split(':', 1)[1].lower() if ':' in key else ''
+                self_name = str(official.get('username', '')).lower()
+                if not target_name:
+                    self._send_json(400, {'error': 'Invalid official account.'})
+                    return
+                if target_name == self_name:
+                    self._send_json(400, {'error': 'You cannot delete your own admin account.'})
+                    return
+                target = self._get_official(target_name)
+                if target is None:
+                    self._send_json(404, {'error': 'Official account not found.'})
+                    return
+                if target.get('isAdmin') and str(target.get('status', 'approved')) == 'approved':
+                    # Never leave the barangay with zero approved admins.
+                    remaining = 0
+                    cursor = conn.execute("SELECT value FROM kv_store WHERE key LIKE 'officials:%'")
+                    for (value,) in cursor.fetchall():
+                        try:
+                            rec = json.loads(value)
+                        except Exception:
+                            continue
+                        if (rec.get('username', '').lower() == target_name or
+                                str(rec.get('status', 'approved')) != 'approved' or
+                                not rec.get('isAdmin')):
+                            continue
+                        remaining += 1
+                    if remaining < 1:
+                        self._send_json(400, {'error': 'You cannot delete the last remaining admin account.'})
+                        return
+                with conn:
+                    conn.execute('DELETE FROM kv_store WHERE key = ?', (key,))
+                    conn.execute('DELETE FROM kv_store WHERE key = ?', (f'resets:{target_name}',))
+                    # Drop any live sessions for the deleted account.
+                    rows = conn.execute("SELECT key, value FROM kv_store WHERE key LIKE 'sessions:%'").fetchall()
+                    for (skey, svalue) in rows:
+                        try:
+                            sess = json.loads(svalue)
+                        except Exception:
+                            continue
+                        if str(sess.get('username', '')).lower() == target_name:
+                            conn.execute('DELETE FROM kv_store WHERE key = ?', (skey,))
+                self._send_json(200, {'success': True})
+                return
             with conn:
                 conn.execute('DELETE FROM kv_store WHERE key = ?', (key,))
             self._send_json(200, {'success': True})
@@ -736,11 +946,27 @@ class StorageHandler(BaseHTTPRequestHandler):
         if not identifier or not password:
             self._send_json(400, {'error': 'Enter your username or Gmail and password.'})
             return
-        if self._rate_limited('login', *RATE_LIMITS['login']):
+        ip = self._client_ip()
+        # Layer 1 (generous per-IP bot guard): 60 attempts / 5 min by default.
+        # Normal humans do 1-3 clicks; this only trips on automation or a
+        # proxy sharing one IP across many machines (set TRUST_PROXY=1 then).
+        if self._rate_limited('login', LOGIN_IP_LIMIT, LOGIN_IP_WINDOW,
+                              message='Too many login attempts from this network. Please wait a few minutes and try again.'):
+            return
+        # Layer 2 (per-account guessing guard): only FAILED passwords consume
+        # quota. Peek without consuming — failures are recorded below.
+        fails = _bucket_hits('loginfail', identifier, LOGIN_FAIL_WINDOW)
+        if len(fails) >= LOGIN_FAIL_LIMIT:
+            retry_after = _rate_retry_after('loginfail', identifier, LOGIN_FAIL_WINDOW)
+            mins = max(1, round(retry_after / 60))
+            self._send_json(429, {'error': f'Too many wrong passwords for this account. Try again in about {mins} minute(s).',
+                                  'retryAfter': retry_after},
+                            extra_headers={'Retry-After': retry_after})
             return
 
         official = self._find_official(identifier)
         if not official:
+            _bucket_hits('loginfail', identifier, LOGIN_FAIL_WINDOW).append(time.time())
             self._send_json(401, {'error': 'No account found with that username or Gmail.'})
             return
         if official.get('status') == 'pending':
@@ -750,7 +976,10 @@ class StorageHandler(BaseHTTPRequestHandler):
             self._send_json(403, {'error': 'Your account was rejected. Please contact the barangay office.'})
             return
         if not _verify_password(official, password):
-            self._send_json(401, {'error': 'Incorrect password.'})
+            left = max(0, LOGIN_FAIL_LIMIT - len(_bucket_hits('loginfail', identifier, LOGIN_FAIL_WINDOW)) - 1)
+            _bucket_hits('loginfail', identifier, LOGIN_FAIL_WINDOW).append(time.time())
+            hint = f' ({left} attempt(s) left before a short cooldown)' if left <= 5 else ''
+            self._send_json(401, {'error': f'Incorrect password.{hint}'})
             return
 
         # Migrate legacy plaintext accounts to a salted hash.
@@ -763,6 +992,10 @@ class StorageHandler(BaseHTTPRequestHandler):
 
         token = secrets.token_urlsafe(32)
         self._store(self._session_key(token), {'username': official.get('username'), 'expires': time.time() + SESSION_TTL})
+        # A successful login proves humanity — free both buckets so earlier
+        # typos never lock out a legitimate user (or a shared office IP).
+        _clear_rate_limit('login', self._client_ip())
+        _clear_rate_limit('loginfail', identifier)
         self._send_json(200, {'token': token, 'official': self._strip_secrets(official)})
 
     def _handle_logout(self):
@@ -815,6 +1048,16 @@ class StorageHandler(BaseHTTPRequestHandler):
         official = self._find_official(identifier)
         if not official or official.get('status') != 'approved':
             self._send_json(404, {'error': 'No approved account found with that username or Gmail.'})
+            return
+        # Per-account backstop so rotating IPs can't spam one victim's inbox
+        # (or burn SMTP quota) even if the IP bucket is dodged.
+        acct_key = str(official.get('username', '')).lower()
+        if not _rate_limit('resetacct', acct_key, 3, 900):
+            retry_after = _rate_retry_after('resetacct', acct_key, 900)
+            mins = max(1, round(retry_after / 60))
+            self._send_json(429, {'error': f'Too many reset codes sent to this account. Try again in about {mins} minute(s).',
+                                  'retryAfter': retry_after},
+                            extra_headers={'Retry-After': retry_after})
             return
         code = str(secrets.randbelow(1000000)).zfill(6)
         self._store(f'resets:{official["username"]}', {
@@ -904,10 +1147,20 @@ class StorageHandler(BaseHTTPRequestHandler):
         self._send_json(200, {'ok': True, 'official': self._strip_secrets(updated)})
 
     def _handle_chat(self):
-        if REQUIRE_CHAT_AUTH and not self._get_session():
+        session = None
+        if REQUIRE_CHAT_AUTH or self._get_token():
+            session = self._get_session()
+        if REQUIRE_CHAT_AUTH and not session:
             self._send_json(401, {'error': 'Please log in to use the chat.'})
             return
-        if self._rate_limited('chat', *RATE_LIMITS['chat']):
+        # Logged-in users are throttled per account (not per IP) so one busy
+        # network can't get everyone else's chat blocked — and IP spoofing
+        # can't burn someone else's quota.
+        if session and session.get('username'):
+            chat_key = f"user:{str(session.get('username')).lower()}"
+        else:
+            chat_key = f"ip:{self._client_ip()}"
+        if self._rate_limited('chat', *RATE_LIMITS['chat'], key=chat_key):
             return
         data = self._read_json()
         if not isinstance(data, dict):
@@ -1069,7 +1322,20 @@ class StorageHandler(BaseHTTPRequestHandler):
         return '\n'.join(prompt_lines)
 
 
-def run(server_class=ThreadingHTTPServer, handler_class=StorageHandler, port=None):
+class PortalServer(ThreadingHTTPServer):
+    """HTTP server sized for ~15-20 simultaneous users.
+
+    - daemon_threads: handler threads never block process shutdown / redeploy.
+    - request_queue_size=128: the listen backlog absorbs login/polling bursts
+      instead of refusing connections (the socketserver default is 5).
+    - allow_reuse_address: restarts don't trip over TIME_WAIT sockets.
+    """
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 128
+
+
+def run(server_class=PortalServer, handler_class=StorageHandler, port=None):
     if port is None:
         port = PORT
     server_address = ('', port)
