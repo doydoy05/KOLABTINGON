@@ -557,7 +557,21 @@ export default function BarangayPortal() {
     if (newPw.length < 6) return { ok: false, error: "New password must be at least 6 characters." };
     try {
       const res = await apiPost("/api/change-password", { currentPw, newPw });
-      if (!res.ok) return { ok: false, error: res.error || "Could not update your password." };
+      if (!res.ok) {
+        if (res.status === 401) {
+          // Session died server-side (e.g. backend restarted). Drop local auth
+          // state so the user lands back at login instead of a dead-end error.
+          try { localStorage.removeItem("bportal_token"); } catch {}
+          setCurrentOfficial(null);
+          setRequests([]);
+          setFeedbackList([]);
+          setForcePassword(false);
+          setView("public");
+          setDashTab("overview");
+          return { ok: false, error: "Your session expired. Please log in again." };
+        }
+        return { ok: false, error: res.error || "Could not update your password." };
+      }
       setCurrentOfficial(res.official);
       setOfficials((prev) => prev.map((o) => (o.username === res.official.username ? res.official : o)));
       return { ok: true };
@@ -1850,13 +1864,14 @@ function Dashboard({
         <ForcePasswordModal
           changePassword={changePassword}
           onDone={() => setForcePassword(false)}
+          onLogout={() => { handleLogout(); setForcePassword(false); }}
         />
       )}
     </div>
   );
 }
 
-function ForcePasswordModal({ changePassword, onDone }) {
+function ForcePasswordModal({ changePassword, onDone, onLogout }) {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -1892,6 +1907,9 @@ function ForcePasswordModal({ changePassword, onDone }) {
         {error && <p className="form-error">{error}</p>}
         <button className="btn-primary lg" disabled={busy} onClick={handleSave} style={{ width: "100%" }}>
           {busy ? <><Loader2 size={16} className="spin" /> Saving&hellip;</> : <><KeyRound size={16} /> Save new password</>}
+        </button>
+        <button className="btn-ghost sm" onClick={onLogout} style={{ width: "100%", marginTop: 8 }}>
+          <LogOut size={14} /> Log out instead
         </button>
       </div>
     </div>
