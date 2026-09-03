@@ -297,8 +297,10 @@ export default function BarangayPortal() {
         } catch { return null; }
       }));
       const valid = items.filter(Boolean).map(o => ({ ...o, status: o.status || "approved" }));
-      setOfficials(valid.filter(o => o.status === "approved").sort((a, b) => a.dateJoined - b.dateJoined));
-      setPendingOfficials(valid.filter(o => o.status === "pending").sort((a, b) => a.dateJoined - b.dateJoined));
+      // Hidden back-office logins (hidden: true) never appear in any list.
+      const visible = valid.filter(o => !o.hidden);
+      setOfficials(visible.filter(o => o.status === "approved").sort((a, b) => a.dateJoined - b.dateJoined));
+      setPendingOfficials(visible.filter(o => o.status === "pending").sort((a, b) => a.dateJoined - b.dateJoined));
     } catch { setOfficials([]); setPendingOfficials([]); }
   }, []);
 

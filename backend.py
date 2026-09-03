@@ -143,9 +143,10 @@ def _ensure_demo_admin():
     admin_user = os.environ.get('ADMIN_USERNAME', 'admin').strip().lower() or 'admin'
     admin_pw = os.environ.get('ADMIN_PASSWORD', '')
     admin_email = os.environ.get('ADMIN_EMAIL', '').strip().lower()
+    admin_hidden = os.environ.get('ADMIN_HIDDEN', '').lower() in ('1', 'true', 'yes')
     key = f'officials:{admin_user}'
     row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (key,)).fetchone()
-    if row and (admin_pw or admin_email):
+    if row and (admin_pw or admin_email or admin_hidden):
         try:
             rec = json.loads(row[0])
         except Exception:
@@ -159,6 +160,9 @@ def _ensure_demo_admin():
             changed = True
         if admin_email and rec.get('email') != admin_email:
             rec['email'] = admin_email
+            changed = True
+        if admin_hidden and not rec.get('hidden'):
+            rec['hidden'] = True
             changed = True
         if rec.get('status') != 'approved' or not rec.get('isAdmin'):
             rec['status'] = 'approved'
@@ -189,6 +193,8 @@ def _ensure_demo_admin():
     }
     if admin_email:
         demo['email'] = admin_email
+    if admin_hidden:
+        demo['hidden'] = True
     with conn:
         conn.execute('INSERT INTO kv_store (key, value) VALUES (?, ?)', (key, json.dumps(demo)))
 
@@ -478,6 +484,21 @@ class StorageHandler(BaseHTTPRequestHandler):
                 return
             cursor = conn.execute('SELECT key FROM kv_store WHERE key LIKE ? ORDER BY key', (f'{prefix}%',))
             all_keys = [row[0] for row in cursor.fetchall()]
+            # Hidden officials (e.g. a back-office admin login) are invisible
+            # to everyone except admins — even though the officials: prefix is
+            # publicly listable.
+            if prefix.startswith('officials:'):
+                if not (official and official.get('isAdmin')):
+                    visible = []
+                    for key in all_keys:
+                        row = conn.execute('SELECT value FROM kv_store WHERE key = ?', (key,)).fetchone()
+                        try:
+                            hidden = bool(json.loads(row[0]).get('hidden')) if row else False
+                        except Exception:
+                            hidden = False
+                        if not hidden:
+                            visible.append(key)
+                    all_keys = visible
             total = len(all_keys)
             try:
                 limit = int(params.get('limit', ['0'])[0])
@@ -509,6 +530,9 @@ class StorageHandler(BaseHTTPRequestHandler):
             if key.startswith('officials:'):
                 try:
                     rec = json.loads(value)
+                    if rec.get('hidden') and not (official and official.get('isAdmin')):
+                        self._send_json(404, {'error': 'Not found'})
+                        return
                     value = json.dumps(self._strip_secrets(rec))
                 except Exception:
                     pass
